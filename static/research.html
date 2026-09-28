@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>股票研究</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/research.css">
+</head>
+<body class="research-page">
+  <header class="topbar research-topbar">
+    <div class="brand research-brand"><span class="brand-mark">▥</span><div><h1>股票研究</h1><span class="subtitle">个人投资研究评分 · <span id="rule-version">规则版本加载中…</span> · 不构成买卖建议</span></div></div>
+    <nav class="topnav" aria-label="一级导航">
+      <a class="nav-link" href="/">观察价管理</a>
+      <a class="nav-link active" href="/static/research.html">股票研究</a>
+    </nav>
+    <div class="actions top-actions">
+      <div class="research-search"><span>⌕</span><input type="search" id="search" placeholder="搜索代码 / 名称，如 002714 / 牧原股份" autocomplete="off"></div>
+      <button class="btn btn-primary app-button" id="btn-analyze">分析股票</button>
+    </div>
+    <div class="suggest" id="suggest" hidden></div>
+  </header>
+
+  <main class="research-shell">
+    <aside class="research-library" aria-label="研究库">
+      <div class="library-head">
+        <div><h2>研究库</h2><p>按主模型、评分与风险快速筛选</p></div>
+        <!-- 计数与「刷新全部价格」包一层：.library-head 是 space-between，直接塞第三个
+             子元素会把计数挤到正中。 -->
+        <div class="library-head-right">
+          <span class="library-count" id="library-count">0</span>
+          <button class="btn btn-sm" id="btn-refresh-all" title="逐只重跑研究评分（价格、市值、PE、PB 一并更新）">↻ 刷新全部价格</button>
+        </div>
+      </div>
+      <!-- 筛选维度是「主模型」（Router 的 primary_model），chip 由 research.js
+           按当前库里真实存在的模型生成；这里只放加载前的占位。 -->
+      <div class="filter-scroll" id="type-seg">
+        <button class="filter-chip active" data-model="all">全部</button>
+      </div>
+      <div class="library-sort"><span>排序</span><div class="app-select" id="sort-select"><button class="app-select-trigger" id="sort-toggle" type="button" aria-haspopup="listbox" aria-expanded="false"><span id="sort-label">总评分</span><i>⌄</i></button><div class="app-select-menu" id="sort-menu" role="listbox" hidden><button data-sort-option="total_score" role="option">总评分</button><button data-sort-option="value" role="option">估值分</button><button data-sort-option="quality" role="option">质量分</button><button data-sort-option="price" role="option">当前价格</button><button data-sort-option="net_cash_ratio" role="option">调整后净现金 / 市值</button><button data-sort-option="updated_at" role="option">最近更新</button></div></div></div>
+      <div class="library-table" id="library-wrap">
+        <table class="research-stocks app-table"><thead><tr><th>股票</th><th class="num">价格</th><th class="num">评分</th><th class="num">Δ评分</th><th>风险</th></tr></thead><tbody id="tbody"></tbody></table>
+        <div class="empty library-empty" id="empty">研究库为空。搜索并分析一只股票，即可建立第一份研究档案。</div>
+      </div>
+      <div class="library-foot">点击任意股票，在右侧打开研究详情</div>
+    </aside>
+
+    <section class="research-detail-empty" id="detail-empty">
+      <div class="empty-illustration">▦</div><h2>打开一份研究档案</h2><p>从左侧研究库选择股票，或通过顶部搜索开始分析。</p>
+    </section>
+
+    <aside class="drawer research-detail" id="drawer" hidden aria-label="股票研究详情">
+      <div class="drawer-head" id="drawer-head"></div>
+      <nav class="drawer-tabs" id="drawer-tabs" aria-label="研究详情标签"></nav>
+      <div class="drawer-body" id="drawer-body"></div>
+    </aside>
+  </main>
+  <div class="toast" id="toast" hidden></div>
+  <script src="/static/research.js"></script>
+</body>
+</html>

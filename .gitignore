@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# 数据库与抓取产物：体积大（data/ 约 2.7G）、且含行情/财报原始数据，
+# 一律不进版本库。代码要能只靠 JSON 夹具跑起来。
+data/
+
+# 本地机器专属设置（含本机绝对路径），不上传。
+.claude/settings.local.json
+
+# 仓库根上这个 0 字节 research.db 是误建的；真库在 data/research.db。
+/research.db

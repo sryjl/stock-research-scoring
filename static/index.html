@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>A股观察价位管理</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <h1>观察价位管理</h1>
+      <span class="subtitle">观察 → 三档买入 → 每笔独立止盈</span>
+    </div>
+    <nav class="topnav">
+      <a class="nav-link active" href="/">观察价管理</a>
+      <a class="nav-link" href="/static/research.html">股票研究</a>
+    </nav>
+    <div class="actions">
+      <span class="quote-status" id="quote-status">休市</span>
+      <button class="btn" id="btn-quote" title="从行情源拉取最新价">↻ 刷新行情</button>
+      <button class="btn btn-primary" id="btn-add">＋ 添加股票</button>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="toolbar">
+      <div class="toolbar-row">
+        <input type="search" id="search" class="search" placeholder="搜索代码 / 名称…" autocomplete="off">
+        <div class="seg" id="type-seg">
+          <button class="seg-btn active" data-type="all">全部</button>
+          <button class="seg-btn" data-type="trade">交易型 / 烟蒂</button>
+          <button class="seg-btn" data-type="hold">长持型</button>
+        </div>
+        <div class="sort-group">
+          <select id="sort" class="select">
+            <option value="distance_abs">距离观察价（最近）</option>
+            <option value="distance_pct">距离观察价 %</option>
+            <option value="current_price">当前价</option>
+            <option value="watch_price">观察价</option>
+            <option value="code">代码</option>
+            <option value="name">名称</option>
+          </select>
+          <button class="btn btn-ghost" id="btn-dir" title="切换升/降序">↑</button>
+        </div>
+        <label class="auto-refresh"><input type="checkbox" id="auto-refresh" checked> 交易时段自动刷新</label>
+      </div>
+      <div class="toolbar-row">
+        <span class="label">快筛</span>
+        <button class="chip" data-quick="triggered">已触发买入</button>
+        <button class="chip" data-quick="holding">已持仓</button>
+        <button class="chip" data-quick="tp">达到止盈</button>
+        <span class="divider"></span>
+        <span class="label">标签</span>
+        <div class="tags" id="tag-chips"></div>
+      </div>
+    </section>
+
+    <div class="summary-bar" id="summary-bar">
+      <span class="s-item">总浮盈浮亏（未实现）<b id="sum-unrealized">—</b></span>
+      <span class="s-item">总累计盈利（已实现）<b id="sum-realized">—</b></span>
+    </div>
+
+    <section class="table-wrap">
+      <table class="stocks" id="stocks-table">
+        <thead>
+          <tr>
+            <th class="sortable" data-sort="code">代码</th>
+            <th class="sortable" data-sort="name">名称</th>
+            <th>类型</th>
+            <th>标签</th>
+            <th class="num sortable" data-sort="current_price">当前价</th>
+            <th class="num sortable" data-sort="watch_price">观察价</th>
+            <th class="num">-5%</th>
+            <th class="num">-10%</th>
+            <th class="num">+5%</th>
+            <th class="num">+10%</th>
+            <th class="num sortable" data-sort="distance_pct">距离%</th>
+            <th class="num sortable" data-sort="unrealized_pnl">浮盈</th>
+            <th class="num sortable" data-sort="realized_pnl">已实现</th>
+            <th>第一笔</th>
+            <th>第二笔</th>
+            <th>第三笔</th>
+            <th>备注</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+      <div class="empty" id="empty" hidden>暂无数据，点击「添加股票」开始。</div>
+    </section>
+  </main>
+
+  <div class="modal-overlay" id="modal-overlay" hidden>
+    <div class="modal" id="modal"></div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

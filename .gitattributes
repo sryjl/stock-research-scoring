@@ -1,0 +1,19 @@
+# 行尾钉死。clone 到任何机器都要保持这些约定，不能让 core.autocrlf 自作主张。
+#
+# run.bat 必须是 CRLF：cmd.exe 解析 LF 行尾的 .bat 会失败（标签/续行错位）。
+# 这条是硬性的，别改。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 其余文本统一 LF 入库。
+*.py  text eol=lf
+*.js  text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.md  text eol=lf
+
+# 二进制：不做任何行尾转换，也不做 diff。
+*.pdf binary
+*.db  binary
+*.xlsx binary
+*.docx binary
