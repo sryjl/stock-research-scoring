@@ -6,12 +6,12 @@
 
 | 项 | 值 |
 |---|---|
-| 最后核对 | 2026-09-27 |
+| 最后核对 | 2026-09-29 |
 | `RULE_VERSION` | `SCORING_EXPERIMENTAL` |
 | `ROUTER_VERSION` | `MODEL_ROUTER_V1.0` |
-| 在库股票 | 28 只，全部 `audit_status = OK`（前 27 只 + 600502 安徽建工） |
-| factor baseline | 28 只的最新一批 run 是**批 4.1 内容**（2026-09-27 02:14–02:15 线上重跑，`baseline_tag` 为空；21 只内容变过、7 只去重命中，见 §11.17.6）；上一代 `CANONICAL_BASELINE_2026_09_B31` 仍在库里 |
-| 测试基线 | `python -m unittest discover -s tests -q` → **1155 条全绿**（34.6s；批 4.1 新增 17：`test_valuation_anchors` 32 → 42、`test_market_context` +6 = 70、`test_factor_layer` +1 = 163；批 4 的 32/13/+12/+11 与其 +2 条 coverage 收尾见 §11.17） |
+| 在库股票 | 29 只，全部 `audit_status = OK`（前 28 只 + **601166 兴业银行**，第 29 只的入库见 §11.18.9） |
+| factor baseline | 29 只；`baseline_tag` 只存在两代——`CANONICAL_BASELINE_2026_09`（28 只）与 `CANONICAL_BASELINE_2026_09_B31`（28 只），其余 run 的 `baseline_tag` 为空。**批 6 / 批 7 都没有重跑线上库**（批 7 只写了 4 条猪企成本观测，见 §11.22.9） |
+| 测试基线 | `python -m unittest discover -s tests -q` → **1495 条全绿**（47.5s；批 9 新增 **14**，见 §11.24.9；批 8 的 1481 见 §11.23.9；批 7 新增 53 见 §11.22.10；批 6 的 +59 见 §11.21.8；批 4.1 的 1155 见旧读数） |
 
 > **本文描述的是「当前生效的那一套评分规则」，即旧的 8 模块 + 5 模板 + 6 模型。**
 > `SCORING_ARCH_REFACTOR_EXPERIMENTAL` 新增的 canonical factor 层 + 四维研究框架
@@ -26,8 +26,11 @@
 > 2. **新层只加键**：`result["factor_layer"]` 是接线后**唯一**新增的键；同一份 `m` 上
 >    接线前链条与接线后 `_run_analysis` 在 27 只上逐字相等（旧 8 模块、判型、
 >    风险等级、路由决策全等）。
-> 3. **前端还没改**：批 6 才做四张主卡 + factor 表；页面此刻只多拿到
+> 3. **四张主卡 + factor 表还没做**：页面此刻只多拿到
 >    `research_summary`（列表）与 `factor_layer`（详情）两个载荷键，渲染仍旧。
+>    **另一个载荷已经接了**：批 5.2 起 `/static/research.html` 有**猪行业页**
+>    （猪企卡片 + 证据视图，读 `/api/research/pig-evidence`），批 7 又给它补了成本链那几行
+>    （见 §11.20 / §11.22.7）——那与四张主卡是两回事。
 
 ---
 
@@ -79,6 +82,9 @@
   的记法 / `risk_reward_ratio` 的输入从 raw 换回 effective → §11.17.1 + §11.17.6
 - **批 4.1 起**：改 B 语义（`peer_pe_distribution`）的样本门槛 / 分位名单 / 输出字段，
   或改 A 语义的 `reason_code` 词表（`SAMPLE_STATUS_CODES`）→ §11.16 §六 + §11.17.6
+- **批 5 起**：增删改猪行业的指标注册（`METRIC_IDS` / `MetricDef.variants` / `SCOPE_*` /
+  `GAP_REASONS`）或观测仓 `pig_metric_observation` 的列 → §11.19（现状）+ 那一批自己的节
+  （批 5.1 / 5.2 / 6 / **7 = §11.22**）
 
 ### 0.3 维护方式
 
@@ -1412,7 +1418,7 @@ is_direct_disclosure  status  lower_bound  upper_bound  note
 | `pig_exposure` | APPLICABILITY | —（不出分） | NEUTRAL |
 | `margin_position` | SCORE | **0.25** | LOWER_BETTER |
 | `supply_contraction` | SCORE | **0.20** | HIGHER_BETTER |
-| `price_position` | SCORE | **0.15** | LOWER_BETTER |
+| `sale_price_level` | SCORE | **0.15** | LOWER_BETTER |
 | `cost_advantage` | SCORE | **0.15** | HIGHER_BETTER |
 | `capacity_delivery` | SCORE | **0.15** | HIGHER_BETTER |
 | `price_premium` | SCORE | **0.10** | HIGHER_BETTER |
@@ -1757,7 +1763,8 @@ variant_fallback(metric_id, wanted)  # 候选必须同时满足：
   那一条刻意让 unit 与 scope 都对齐，把锁单独留给基准）。
 - 读数新增 `expected_variant` / `variant_fallback` / `variant_fallback_reason`，
   且 **`gaps` 仍报「正身口径没值」**：「有读数」与「正身仍缺」必须同时可见。
-- 实测结果：四家的 `company_sale_price` / `output_volume` / `price_position` 由**全空变有值**
+- 实测结果：四家的 `company_sale_price` / `output_volume` / `sale_price_level`
+  （批 5.2 记录时叫 `price_position`，批 6 改名）由**全空变有值**
   （值 = 最近一期的月价 / 月销量），`pig_product_price` 由行业序列给。其余 15 个因子
   继续 missing，理由仍来自 `GAP_REASONS`（**本批不加数据源**）。
 
@@ -1883,14 +1890,16 @@ RULES_V1["pig"]["premium_min_benchmark_points"] = 20
   的 DDL 一个字没改，`RECORD_COLUMNS` 19 列不动，`benchmark_type` 只是**新增合法取值**，
   `RULE_VERSION` 仍是 `SCORING_EXPERIMENTAL`。
 
-#### 11.20.9 本批**不修**的一处（如实记账）
+#### 11.20.9 本批**不修**的一处（如实记账，根因在 §11.21.1 订正）
 
 `pig_industry_series` 里 **2026-09-01…09-26 每天 2 行**（值相同、`series_hash` 不同，
-`fetched_at` 一个 03:52 一个 03:56）——同一份事实被写了两遍，原因是同一份数据的**两条取数路径**
-各回了一次。月均**去重后不受影响**（`points` 按日期去重，`revisions` 如实报出来），
-但表里的行数是虚的（`points=26 / rows=52 / revisions=26`）。
-**本批不修**：这是 append-only 表，去重要么加唯一约束（改表结构）、要么删行（改历史），
-两件都不在本批范围。已记在这里，下一批处理。
+`fetched_at` 一个 03:52 一个 03:56）——同一份事实被写了两遍。月均**去重后不受影响**
+（`points` 按日期去重，`revisions` 如实报出来），但表里的行数是虚的
+（`points=26 / rows=52 / revisions=26`）。**本批不修**，下一批处理。
+
+> **本节当初写的根因是错的**（「同一份数据的**两条取数路径**各回了一次」）。批 6 逐行查证
+> 后订正为**两次不同窗口的 ingest**，取证见 §11.21.1。这里保留原文以便对照——错的是解释，
+> 不是「本批不修」这个判断。
 
 #### 11.20.10 未决（接 §11.19.7）
 
@@ -1898,10 +1907,969 @@ RULES_V1["pig"]["premium_min_benchmark_points"] = 20
    `commodity_hog_sales_volume`（**有的家到了**：002714 703.0 万头、000876 120.61 万头；
    001201 / 002100 是 `INSUFFICIENT_SCOPE`，它们的简报只披露合计口径）与
    `effective_capacity`（四家全缺）→ 整体仍 missing，理由点名的是缺的那一个。
-   同理 `price_position` 两个依赖都齐 → 有值，而 `pig_product_price` 只靠行业序列。
+   同理 `sale_price_level`（原 `price_position`）两个依赖都齐 → 有值，
+   而 `pig_product_price` 只靠行业序列。
    `average_sale_weight`（均重）在读数层仍**没有消费方**，只进证据载荷。
 2. `full_cost` / `unit_margin` / `effective_capacity` **仍然 missing**，理由照旧
    （不许分部成本反推 / 营业成本÷销量 / 毛利率倒推 / 第三方估计 / 写死；不许用固定资产 /
    在建工程 / 规划产能粗推）。这与「补数据源」是两件事，本批**不补**。
 3. 能繁母猪存栏（`sow_inventory`）序列里**没有**，行业序列里也没有——继续 missing。
 4. `pig_observations` 至今**没有独立测试文件**（§11.19.6 的老账，本批仍未补）。
+
+---
+
+### 11.21 批 6：事实/修订语义 · 持久化模式隔离 · 分部表解析起步（**仍不改任何评分权重**）
+
+范围只有三件：**清理重复事实**、**隔离测试/dry-run/A-B 对拍对正式快照的副作用**、
+**开始做分部表逐行解析**。明确不做：Pig Score、评分权重 / Router / 阈值 / 曲线、
+`full_cost` / `unit_margin` / `cost_advantage` 的计算。
+
+#### 11.21.1 重复事实的根因（**订正 §11.20.9**）
+
+批 5.2 把根因记成「同一份数据的**两条取数路径**（逐省 line 接口 vs 地图横截面）各回了一次」。
+**这个解释是错的。** 横截面路径只写 `period=抓取日`，最多多出 1 天，解释不了**连续 26 天**。
+
+真实机制是**两次不同窗口的 ingest**：`_point` 的哈希 payload 里塞进了两个**抓取身份**——
+`raw_response_hash`（整窗响应体的 sha256）与 `url`（`providers.py` 把 `sDate/eDate/areaId/type`
+拼成完整 query 后写进 `env["url"]`）。于是窗口边界间接进了事实身份。
+
+逐行取证（迁移报告的 `collapsed` 台账，156 组全部）：
+
+| 观察 | 值 |
+|---|---|
+| 重复组 | **156 组，每组恰好 2 行**（`group_size` 分布 = `[2]`） |
+| 组内 `value` | 全相同 → **0 条真实修订**（`revisions_untouched = 0`） |
+| 被折叠行的 `source_url` | **156/156 都是 `sDate=2026-06-28`**（91 天窗） |
+| 存活行的窗口 | `sDate=2026-09-01`（27 天窗） |
+| 两个窗口的重叠 | 2026-09-01…09-26 = **26 天** ✓ 与重复天数吻合 |
+| 被折叠的 5 个不同 `raw_response_hash` | 91 天窗被**取过 5 次**，每次响应体都不同 |
+
+最后一行是**决定性的**：同一个窗口重取一次，`raw_response_hash` 就变。
+把它放进身份，等于「每抓一次就是一个新事实」——**抓取身份被当成了事实身份**。
+
+**为什么 26 条测试没发现**：假 provider 把 `raw_sha256` 写死成 `"f" * 64`，
+两次抓取的响应指纹必然相同，于是 `test_refetch_only_touches_fetched_at` 永远通过。
+**它断言的契约是对的，是夹具把 bug 盖住了。** 现已改成按窗口生成不同指纹。
+
+#### 11.21.2 事实身份与修订语义
+
+* `series_hash` 只认 `_FACT_IDENTITY_FIELDS`：`metric_id` / `metric_variant` / `region` /
+  `period` / `value` / `unit` / `source_level` / `source_type` / `source_name`。
+  `raw_response_hash` / `source_url` / `request_params` **仍是列**（记「这条事实是哪个响应
+  带来的」，保留首次写入者的值），只是**不再参与身份**——它们是溯源，不是身份。
+* 新列 `last_seen_at`（`ALTER TABLE ADD COLUMN`，幂等）与 `revision_count`
+  （`INTEGER NOT NULL DEFAULT 1`）。`_FACT_KEY_FIELDS` = 身份去掉 `value`，
+  `revision_count` 记的是**这个事实键下有几个版本**。
+* `_write_points` 的冲突分支从「只刷 `fetched_at`」改为：命中同一哈希且值相同 →
+  **只推进 `last_seen_at`**，不新增行、不算 revision；值不同 → 哈希不同 → 仍然 append-only
+  写新行（**旧行一个字不动**），该事实键下所有行的 `revision_count` 一起对齐到版本数。
+* `fetched_at` / `first_seen_at` 保持**第一次写入**的值，不再被覆盖。
+* **副作用（如实记）**：地图横截面路径与 line 路径对同一天、同值、同源的读数，在新身份下
+  会**合并成一行**（今天它们 `scope` 不同，但身份清单里没有 `scope`）。`latest()` 的 docstring
+  已同步订正。
+* **读侧一个字没改**：`monthly_average` 本来就按 `period[:10]` 去重、报 `points`/`rows`/
+  `revisions`/`conflicting_rows`，且 `conflicting_rows` 的定义就是「同日被顶掉且**值不同**的行数」
+  ——它**早就能区分「重复抓取」与「真实修订」**。批 5.2 那张 `points=26 / rows=52 /
+  revisions=26` 的表因此不需要动读侧。
+
+#### 11.21.3 迁移：`research/pig_series_repair.py`（新，dry-run 默认）
+
+离线、不联网、可复跑，`--apply` 才写。**先把报告落盘，再动一行数据**——报告写失败就不动。
+
+* `plan(conn)` 按新身份重算全表，分成**完全重复组**（折叠）、**只需改名**、**本来就对**、
+  **真实修订组**（值不同，一行不动，只对齐 `revision_count`）。
+* 存活行取 `fetched_at` 最早的那条，并集 `first_seen_at` = 组内 min、
+  `last_seen_at` = 组内 max(fetched_at)。
+* 被折叠行的 `series_hash` / `raw_response_hash` / `source_url` / `request_params` /
+  `fetched_at` / `first_seen_at` / `value` **全量写进** `data/pig_series_repair_<时间戳>.json`
+  （不静默删历史）。台账表 `pig_industry_series_meta` 本来就逐次请求留痕，所以「我们做过什么」
+  不算丢——被折叠掉的是**重复的事实**，不是抓取记录。
+* 实测：`3973 → 3817 行`（折叠 156 组 / 删 156 行，改名 3661 行，**真实修订 0 组**）。
+  跑完 `verify()` 断言：无残留重复组、每行 `series_hash` 都等于新身份、`last_seen_at` 非空。
+
+#### 11.21.4 四种持久化模式（`research/engine.py`）
+
+```python
+MODE_PERSIST, MODE_DRY_RUN, MODE_TEST, MODE_COMPARE = "PERSIST", "DRY_RUN", "TEST", "COMPARE"
+_WRITES_RESULTS     = frozenset({MODE_PERSIST})
+_WRITES_INPUT_CACHE = frozenset({MODE_PERSIST, MODE_DRY_RUN})
+```
+
+| 模式 | 结果表 | 输入缓存 | 联网 |
+|---|---|---|---|
+| `PERSIST` | 写 | 写 | 是 |
+| `DRY_RUN`（**默认**） | **不写** | 写 | 是 |
+| `TEST` | **不写** | **不写** | **否** |
+| `COMPARE` | **不写** | **不写** | **否**（用 `frozen`） |
+
+* 门禁只加在三处入口（`_persist` / `_begin_audit` / `_persist_gated`），不散在各写点；
+  `TEST`/`COMPARE` 下 `_research_context` 的三组上下文写入整段跳过。
+* 生产三处**显式**传 `MODE_PERSIST`：`server.py:297`、`server.py:306`、
+  `research/audit_job.py:155`。**用测试钉住**（读源码文本断言含 `MODE_PERSIST`），漏一处就红。
+* `freeze_market(code)`（新）联网取一次，把两臂共用的输入全部冻结并返回；A/B 两臂传**同一个
+  bundle 对象**，对拍判据直接复用现成的 `snapshot_result_hash`（不含 `date`，本来就是幂等的）。
+* `analyze()` 的默认值从「等于落库」变成 `DRY_RUN`——**这是本批最容易踩的一处**，
+  所以既有调用点在这一批里全部复核过。
+
+#### 11.21.5 分部表解析器：`research/pig_segment_tables.py`（新）
+
+这个名字是**补齐**的：`GAP_REASONS[M_PIG_SEGMENT_GROSS_MARGIN]` 与本文档 §11.18 早就把未来的
+解析器称作 `pig_segment_tables`，但全仓此前没有这个名字的代码。本批把它建出来，那句缺口理由
+从「承诺」变成「事实」。纯函数：只读原始片段、不联网、不写库、**不接进 `state()`**。
+
+`extract_segments(meta, runs) -> {"status", "tables", "segments", "notes", "diag"}`
+—— 接受 `runs`（本地 PDF 现取的原始片段），CLI `python -m research.pig_segment_tables
+--code 002714 [--report-period 2026H1]` 由本地缓存现取，**仍然离线、不联网、不新增数据源**。
+
+两类表都解析，用 `table_family` 区分（裁定 4）：
+
+| `table_family` | 表 | 四家覆盖 |
+|---|---|---|
+| `segment_report` | 「报告分部的财务信息」「营业收入和营业成本的分解信息」 | 只有牧原 |
+| `industry_product` | 「分行业/分产品/分地区」「占营业收入或营业利润 10% 以上」 | 东瑞、天康、新希望（损坏→拒答） |
+
+`segment_category` 取值 `PIG / FEED / POULTRY / SLAUGHTER / FOOD / OTHER`，
+照 `asset_semantics.SEMANTIC_RULES` 那套「有序元组、命中即定案、不中就 `OTHER_UNKNOWN`（不猜）」的
+模式写；**不做硬名称匹配**——`raw_segment_name` 原样保留原文，语义只体现在 `segment_category`。
+
+**硬纪律（每条都有测试钉住）**：
+
+* **口径不许丢**：只有表头/列里**明确存在「营业成本」列**时才填 `cost`，**绝不做
+  `cost = revenue − profit`**；`gross_profit` 只在原文给出时才填。`column_map` 记下
+  「哪一列被认成成本」供证据链复核。
+* **拒绝优于猜测**：乱码 / 数字粘连 / 拼不回合法金额 / 行标签只配上一小半 / 收入与成本认到
+  同一行 → `status="unparsable"` + `reason`，**一条 segment 都不产出**。勾稽不过 → `conflict`，
+  不挑一个。表只有表头没有数据行 → `status="empty"` 并**如实报出表题**（不是「没找到」）。
+* **`assets` / `liabilities` / `capex` 可以为 `None` 且必须说清是哪种「没有」**：牧原 p180
+  原文明写「不能披露各报告分部的资产总额和负债总额」，这不是「没抽到」，所以每一行带着
+  原文那句 `reason`。
+
+**贴到几何上才知道的六处**（都是实测踩出来的，`tests/pig_segment_fixtures.py` 是真夹具）：
+
+1. 两列金额只隔 **4.47 磅**（并字阈值 5.4）时不许并——并了会毁掉两个各自合法的金额；
+2. 行标签与数字**不在同一行**时要把同带的碎片按 y 降序拼回来（`屠宰、肉食` + `业务`）；
+3. 表题印在**上一页页脚**时要在上一页的**末尾**几行里找（不是开头）；
+4. 「合并 / 合计 / 本期数 / 同期数」是口径列不是分部；
+5. 数据区**自己的**行距可能只有正文行距的一半（28.8 vs 13 磅），拿整页行距去分行会把三行并成一行；
+6. 覆盖率闸门两个口径：分部维在列上时要求**每行都有名字**（`ratio=1.0, slack=1`），
+   行式表那条路的 `bands` 是从数字区现算的、会把下一张表的行也算进来，只能当地板（`ratio=0.6`）。
+
+#### 11.21.6 §十八 改名 `price_position` → `sale_price_level`
+
+审计结论：读数**就是公司月报商品猪均价原值（元/kg）**，与 `company_sale_price` 共用同一条
+`M_PIG_SALE_PRICE` 记录；「周期位置 / 分位」语义只存在于 `FactorSpec` 的文字里，从未计算
+（`factor_curves` 为空，该 factor 恒为 `display_only`、`loci=[]`、不进任何分母）。
+改名 7 文件 13 处；**只改键名与文字，不改值、不改组内权重、不改曲线**。
+`factor_snapshots` 里的旧 `price_position` 键**保留不动**（按项目规则 #5/#7，旧快照即「旧实验结果」）。
+
+#### 11.21.7 评分隔离——**实测**，不是推理
+
+1. **静态**：`research/rules.py` 的权重 / 点表 / 阈值 / `MODULE_SPECS` / `COMPONENT_UNITS`
+   一字未动，`research/router.py` 一字未改，`factors.py` / `dimensions.py` 的曲线未动
+   （`factor_curves` 保持空）。本批**没有**给 `RULES_V1["pig"]` 新增任何键，也**没有**新开
+   `/api/meta` 指纹轴。
+2. **结构**：解析器不接进 `state()`；四家实测 `pig.state()` 的 `exposure` 是
+   `None / None / None / 0.266981`（002714 / 001201 / 002100 / 000876，**全部 `< 0.5`**），
+   `_pig_result` 在读到 `readings` **之前**就返回。
+3. **实测**：29 只逐只对拍，`total_score` / `primary_model` / `router_version` / `rule_version`
+   **逐位相等**；`pig_industry` 贡献 **29/29 = 0.0**。
+4. 四家 2026-09 月均：`value` 逐位相等（全国 `10.8062`、广东 `11.5544`、2026-08 `10.7571`），
+   `points` 不变（26 / 27），`rows` 52→26、53→27，`revisions` **26 → 0**，`conflicting_rows` 0。
+
+#### 11.21.8 库面与测试代价
+
+* **旧表结构改动：有，且只有一处**——`pig_industry_series` 加 `last_seen_at` / `revision_count`
+  两列（`ALTER TABLE ADD COLUMN`，幂等，只加列不动数据）。不加表、不改主键，
+  `RECORD_COLUMNS` 19 列不动。
+* 行数：`pig_industry_series` **3973 → 3817（−156）**；`research_stocks`(29) /
+  `research_snapshots`(264) / `factor_analysis_runs`(178) / `factor_snapshots`(12184) /
+  `dimension_snapshots`(712) / `pig_metric_observation`(3261) / `pig_industry_series_meta`(89)
+  **一张表都没动**。
+* 测试 **1328 → 1387**（+59，36.556s 全绿）：三个新文件
+  `tests/test_pig_series_repair.py`（12）、`tests/test_engine_modes.py`（15）、
+  `tests/test_pig_segment_tables.py`（30，另加真夹具 `tests/pig_segment_fixtures.py`），
+  既有文件 +2（`test_pig_industry_series.py`），另 1 条按新语义改写期望
+  （`test_refetch_only_touches_fetched_at` → `..._last_seen_at`）。
+  **全部离线、不联网、不碰真库**。既有断言只增不减。
+* `RULE_VERSION` 仍是 `SCORING_EXPERIMENTAL`；本批不改 `rules.py`，所以理论上无需重启，
+  但 `/api/meta` 的 `rule_source_dirty` / `router_source_dirty` 仍实测确认为 `false`。
+
+#### 11.21.9 未决（接 §11.20.10）
+
+1. **分部数据仍未接进评分**：本批只建了解析器与 CLI，`full_cost` / `unit_margin` /
+   `cost_advantage` **仍未计算**，`GAP_REASONS` 那句缺口理由暂时保留（换成「解析器已就绪、
+   尚未接线」比现在更准，但那要等接线那一批一次改完，免得理由文字反复漂）。
+2. **东瑞 p127 的 `column_map.segment_columns` 只有 `{合并, 合计}`**——那张表的分部维在行上
+   （`named_by="row_item"`），所以这一项的键名对行式表其实是空的，语义上应当改名为
+   `owner_columns`。本批不改（会动输出结构），记在这里。
+3. 新希望 p171 / p229 报 `empty`（「营业收入、营业成本的分解信息：」底下没有可解析的表），
+   与 p23 的损坏文本是两回事；本批**拒答是对的**，是否值得专门为这种表再拆一层待定。
+4. `pig_observations` 至今**没有独立测试文件**（§11.19.6 的老账，仍未补）。
+
+---
+
+### 11.22 批 7：猪企成本链 `PIG_COST_CORE_V1`（**仍不改任何评分权重**）
+
+范围一句话：把公司**自己披露**的成本（完全成本 / 育肥完全成本 / 断奶仔猪成本 / 现金成本）
+抓进观测仓，只在「**同期间 + 同口径 + 同单位**」都成立时派生 `unit_margin` 与
+`cost_advantage`，全程留证据。**不改 Pig Score、不改 Router、不动任何评分权重 / 阈值 / 曲线；
+不新增数据源、不联网、不调 LLM。**
+
+代价先说清楚：本批**没有让任何一格从 missing 变成有值**（评分层一个数都没动，见 §11.22.10）。
+它交付的是**事实与拒答清单**——哪几家披露了什么、哪些数为什么不能用。
+
+#### 11.22.1 语料现实：八类文档的覆盖报告（裁定 1）
+
+`pig_cost_core.coverage()` 逐类报数，**缺的类别不许静默为空**（`--coverage`）：
+
+| 类别 | `source_type` | provider | 4 家本地份数 |
+|---|---|---|---|
+| 定期报告 | `annual_or_interim_report` | `reports` | 002714=2 · 001201=2 · 002100=1 · 000876=2 |
+| 月度经营简报 | `monthly_bulletin` | `pig_bulletins` | 全 0（**成本链本批不吃简报**） |
+| 投资者关系活动记录表 | `investor_relations` | **None** | 全 0 ← **本地零份 + 无 provider** |
+| 业绩说明会 | `earnings_briefing` | **None** | 同上 |
+| ESG 报告 | `esg_report` | **None** | 同上 |
+| 公司公告全文 | `company_announcement` | **None** | 同上 |
+| 行业数据 | `industry_data` | `pig_industry_series` | 全 0 |
+| 第三方研究 | `third_party_research` | **None** | 同上 |
+
+**缺的那四类不是「补缓存」能解决的**——`research/providers.py` / `research/reports.py` 里
+根本没有对应的取数通道（`pig_observations.py` 只登记了 L3/L4 的**标签**）。这是本批最重要的一条
+如实记账：缺口是**披露面 + 通道**的，不是解析器的。
+
+四家猪企（`industry_map` 的猪企宇宙硬编码）里 **`300498` 温氏不在研究库**，也没有任何缓存文档，
+本批用不了。定期报告去重后 7 份（中文优先，见 §11.22.3 末）。
+
+#### 11.22.2 口径词表：9 个 variant 全登记，3 格真注册
+
+`COST_VARIANTS` 把 9 个口径**全部**写进词表，每条都带「它答的是哪个问题 + 与谁不可互换」
+（`full_cost` / `fattening_full_cost` / `breeding_full_cost` / `cash_cost` / `piglet_cost` /
+`weaned_piglet_cost` / `feed_cost` / `non_feed_cost` / `other_cost`）。而**真注册进评分层的只有 3 格**
+（裁定 2：真有数据才建格子）：
+
+| 抽取口径 | `metric_id` | 评分层 variant | 单位 | `scope` |
+|---|---|---|---|---|
+| `full_cost` | `M_FULL_COST` | `FULL_COST_COMPANY_DISCLOSED`（旁证） | CNY/kg | `company_commodity_hog` |
+| `fattening_full_cost` | `M_FATTENING_COST` | `fattening_full_cost_per_kg`（**批 7 新增**） | CNY/kg | `company_fattening_hog_normal_lines`（**批 7 新增**） |
+| `weaned_piglet_cost` | `M_WEANED_PIGLET_COST`（**批 7 新增，元/头**） | `weaned_piglet_cost` | CNY/head | `company_piglet` |
+
+三处结构性决定：
+
+1. **正身不许升格**：牧原说的「生猪养殖完全成本」落 `FULL_COST_COMPANY_DISCLOSED`，
+   而正身 `COMPLETE_COST_PER_KG` **继续如实 missing**。理由写在 `GAP_REASONS`：
+   公司自报口径里有的含总部费用、有的不含，拿它跟别家的自报口径比成本优势是拿两把尺子量。
+   `pig_cost_core.CANONICAL_VARIANT` 是正身口径名，本批**一条都没有**。
+2. **「肥猪完全成本」不是 `fattening_cost` 的另一种说法**：正身 `fattening_cost_per_kg` 是
+   **阶段增量成本**（不含期间费用），新希望说的「正常运营场线肥猪完全成本」含期间费用，
+   所以它落在**第二个** variant 上。塞进正身，育肥增量成本就被期间费用顶掉了。
+3. **子集口径独立取值**：`SCOPE_FATTENING_NORMAL_LINES` 是**子集**（不含仔猪、种猪、淘汰猪），
+   不是商品猪口径的另一种说法，且**硬性排除出同行中位数池**（`PEER_SCOPE_EXCLUDED`）。
+
+**注册表有意的两份写法**：读侧 `pig_evidence.COST_GRIDS`（载荷要显式播种哪几行，见 §11.22.8）
+与写侧 `pig_cost_core.REGISTERED_COST_GRID`（抽取器认哪个 variant）。层级方向逼出来的——
+读侧不该 import 抽取器。两份只有「测试会响」才可接受，`tests/test_pig_cost_core.py` 有一条
+漂移测试逐条比对。
+
+#### 11.22.3 抽取判据：窗口、锚、期间
+
+`extract(meta, rows)` 是纯函数，输入是 v3 位置文本行（`reports.ReportCache.load_rows`，
+带 `ROW_CACHE_VERSION` 校验）。一条成本披露 = **期间词 + 主体词 + 成本词 + 数值 + 单位**，
+五件齐了才产出；缺哪件就进 `rejected` 并写明缺哪件。四条判据都是实测逼出来的：
+
+1. **判据单位是窗口，不是行**（`LOOKAHEAD_ROWS = 2`）。句子会跨行断开：牧原 2025A p14 的口径词
+   在 `y=466.51`、**数字在下一行** `443.09`，逐行匹配会漏掉本批最重要的一条。
+   窗口右界另有 `MAX_VALUE_GAP = 45` 字的上限——**45 是量出来的**：无界拼接会把整页并起来
+   造出上百条假命中（实测 118 条），45 字覆盖折行又挡得住噪声。
+2. **锚取「离数字最近」的那个**，不是最左那个。牧原 2026H1 p11 的整句里有两个口径词
+   （「生猪养殖成本同比下降」与「2026年6月生猪养殖完全成本在11.7元/kg左右」），取最左会
+   **同时**拿错口径**和**期间（得到 `2026H1` 而不是 `2026-06`）——一个看起来完全正常的数。
+3. **期间取「数值之前离得最近」的那个期间词**，也不是锚之前那个。
+   `_period_near` 返回 `(period, basis)`，`basis` 写进 `derivation`：年份是从原文读的
+   （`explicit`）还是从报告期拿的（`year_from_report_period`）——后者是**推断**，必须留痕。
+   「近期 / 目前 / 当前 / 现阶段 / 本月 / 报告期末」一类进 `_VAGUE_PERIODS`，命中就明确报
+   `INSUFFICIENT_PERIOD`，而**不是**让期间正则一个都匹配不上、然后静默跳过。
+4. **中文版优先去重**：`000876` 的 2025A 在缓存里有两份（中文 `bb1aaa81a07f5054f8d0` +
+   英文 `f423dbc5018e7771ea38`），而英文版的 `publish_date` 反而**更晚**。不去重会把同一份
+   报告解析两遍，产出两条只差 `document` 的观测——看着像两个来源在互相印证，实际是一份文件。
+
+**判定顺序即优先级**（`_classify`）：
+`QUESTION` → `TARGET` → `RATIO` → `NO_ANCHOR` → `NOT_REGISTERED` / `NO_VALUE` → `SCOPE` →
+`INSUFFICIENT_PERIOD` → 产出。
+
+`NOT_REGISTERED` 与 `NO_VALUE` 是**两件事**，故意分开：前者是「命中了口径**并且后面有数**，
+只是本批没建这格」（要决定的是建不建格子），后者是「命中了口径但**没有数**」（要回去看原文）。
+
+**TARGET / RATIO 的入场券（本批最后改的一处，见 §11.22.12）**：那个词要**贴着成本二字**
+（`_cost_word_near`，±`NEAR_COST_SPAN = 6` 字）**或**句中有口径词命中；命中后理由由
+`_by_proximity` **分三档**写：
+
+* 目标词贴着成本 → 「目标是公司打算做到的事，把它当已实现的成本会系统性高估优秀程度」；
+* 占比词贴着成本 → 「比例乘上不知道的分母还是不知道；而且这类句子常报的是**行业**口径」；
+* 两者都有但离得远 → 「两者同句时一律不收，哪怕它离成本二字很远：**宁可拒答，不可错收**」。
+
+其余形态：**区间**（「11.5-12.0 元/kg」）→ `STATUS_RANGE` + 真实上下界 + `value=None`
+（**不许伪造精确值**）；**元/斤 → 元/公斤**走 ×2 且换算式写进 `conversion_formula`；
+**元/头不换算**且 `raw_unit == normalized_unit`（「不用换算」也要写出来——空着的公式与被省略的
+公式在审计时长得一样）；近似词（约 / 大约 / 左右 / 接近 / 上下…）在数字**前面或后面**都算。
+
+#### 11.22.4 拒答清单实测（4 家，穷举）
+
+7 份定期报告全扫，`diag` 逐份报 `pages` / `sentences` / `anchors_hit` / `duplicates` /
+`skipped_offtopic` / `rejects_deduped`：
+
+| 公司 | 文档 | 抽到 | 拒答 | 拒答按 kind |
+|---|---|---|---|---|
+| 002714 牧原 | 2025A(253p) + 2026H1(196p) | **2** | 77 | `NO_ANCHOR` 51 · `NO_VALUE` 19 · `RATIO` 6 · `TARGET` 1 |
+| 001201 东瑞 | 2025A(199p) + 2026H1(157p) | **0** | 39 | `NO_ANCHOR` 32 · `NO_VALUE` 4 · `RATIO` 3 |
+| 002100 天康 | 2026H1(204p)（**本地无 2025A**） | **0** | 17 | `NO_ANCHOR` 13 · `NO_VALUE` 4 |
+| 000876 新希望 | 2025A(287p) + 2026H1(231p) | **2** | 117 | `NO_ANCHOR` 82 · `NO_VALUE` 16 · `QUESTION` 17 · `RATIO` 2 |
+
+* **抽到 4 条**（全语料的全部）：牧原 `full_cost`/`FULL_COST_COMPANY_DISCLOSED`
+  · 2025A「2025 年全年生猪养殖完全成本**约** 12 元/kg」（`is_approximate=true`，conf 0.9）
+  · 2026-06「**2026 年 6 月**生猪养殖完全成本在 11.7 元/kg **左右**」（conf 0.9）；
+  新希望 `fattening_cost`/`fattening_full_cost_per_kg` · 2025-12 · 12.2 元/公斤 ·
+  `SCOPE_FATTENING_NORMAL_LINES`（精确披露，conf 1.0）
+  与 `weaned_piglet_cost` · 2025A · **251 元/头**（`CNY/head`，不换算，conf 1.0）。
+* **东瑞 / 天康一条数字都没有**：本地语料里只有定性的「降低养殖成本」。
+  **「抽不到」与「抽到了不能用」在这里是同一种**——披露面上就没有这个数。
+* `QUESTION` 单列是本批的一个要点：新希望 p44 那句「**询问**公司 2 月生猪完全成本」来自
+  **L1 定期报告**（投资者关系活动汇总表），但它是**提问**不是公司给的结论。
+  17 条全部拒答，**绝不产出 OK 观测**，也**不许**因为它是「问答」就把它降级标成 L3/L4。
+* 被 `_COST_CONTEXT_WORDS`（猪 / 养殖 / 育肥 / 断奶 / 饲料 / 原材料 / 原料）挡掉的离题句
+  每份 200+ 条（一份 250 页年报里四百多句带「成本」，绝大多数在讲营业成本、销售费用、
+  管理费用）。这个门不是省事，是**让拒答清单可读**；被挡掉的条数照样报在 `skipped_offtopic` 里。
+* 同一句话被不同窗口各截一段 → `_dedupe_rejects` 只留最长的那条（牧原 2025A p20 的占比句
+  被截成三条）；**已被收下的那条事实不许在拒答清单里再出现一次**（`_drop_covered`），
+  否则读的人只会以为解析器在自相矛盾。
+
+#### 11.22.5 观测仓加两列（裁定 5）
+
+`pig_metric_observation`：`SCHEMA` / `COLUMNS`（30 → **32**）/ `Observation.__init__` /
+`load` / `to_dict` / `preferred`（两个分支）/ `_PREFERRED_FIELDS`（21 → **23** 项，
+三个分支键集逐字相同）同步加：
+
+* `is_approximate INTEGER NOT NULL DEFAULT 0` —— 原文自己写着「约 / 左右」，这是**披露的属性**，
+  不是我们的猜测；
+* **`extraction_confidence REAL`** —— 列名带 `extraction_` 前缀是**刻意**的：
+  `pig_readings` 的 `confidence` 含义是「来源有多硬」（按 `source_level` 算，冲突时乘 0.5），
+  这里的含义是「这次抽取有多确定」。两个不同含义同名会在**同一份 JSON** 里撞车
+  （`_candidate` 会同时带出观测的与记录的）。`CONFIDENCE_EXACT = 1.0` / `CONFIDENCE_APPROX = 0.9`。
+
+配套三处：
+
+* **`_hash()` 覆盖 `is_approximate`**：同一个数「公司说约 12」与「公司说 12」是**两次不同的
+  披露**，不覆盖就会被静默去重成一条，而差的那一点恰恰是「这个数有多硬」；
+* **`check_errors` 加第五条**：标了近似就必须降置信。「配置漏写」不是「数据缺失」，
+  该报出来而不是补个默认值；
+* **`ensure_schema` 补幂等加列**（`PRAGMA table_info` + `ALTER TABLE ADD COLUMN`，
+  照 `pig_industry_series` 的既有模式）——`CREATE TABLE IF NOT EXISTS` 对已存在的表一个字都不改，
+  老库不会长出新列。**只加列、不回填**：老库里一行近似值都没有，DEFAULT 0 就是真值；
+  而 `ensure_schema` 是**读路径**会调的（`load` 第一行就是它），让它顺手写一笔，
+  「dry-run 不写库」就成了假话。
+
+#### 11.22.6 派生：`unit_margin` / `cost_advantage`（**只读，一行不写**）
+
+`derive(conn, code)` 返回 `{records, pairs, skipped, notes}`——`skipped` 逐条说明
+「哪一期没出、为什么」，它是**验收材料**不是日志（`pig_premium.derive` 的既有先例）。
+
+`unit_margin` 要**六项同时成立**，缺一即 skip：①期间**逐字相同**（复用 `pig_premium.MONTH_RE`，
+`2025A` 这种区间期一律 skip）；②`scope` 相同（子集 ≠ 商品猪）；③单位相同且为 `CNY/kg`；
+④成本侧是**直接披露**（不是 L7）；⑤两侧 `status` 都 OK 且都有值；⑥variant 在册。
+`cost_advantage = peer_median_cost − company_cost`（正值 = 公司成本**低于**同行）
++ `cost_advantage_pct`（存进 `peer_median_deviation`，单位是 %——绝对差额放 `derivation`）；
+同行池要求**同期间 + 同 variant + 同 scope + 同单位**且 `len(peers) >= PEER_MIN = 3`，
+否则 `INSUFFICIENT_PEERS`。**不凭印象预设谁成本最低。**
+
+**本批的如实结果**（不是注释，是实测）：
+
+* `unit_margin`：**只有 1 条**——牧原 `2026-06`：`9.69 − 11.7 = −2.01 元/公斤`
+  （`is_estimated=True` / `SRC_DERIVED` / `is_approximate` 从成本侧继承）。
+  其余全部 skip：牧原 2025A 是**区间期**、两家新希望的数是**子集口径 / 元每头**。
+* `cost_advantage`：**0 条，全部 `INSUFFICIENT_PEERS`**。4 家的自报成本落在 3 个不同的
+  （期间 × variant × scope）组合上，一个组合都凑不满 3 家。
+* **派生结果本批不落库**：`--apply` 只 append 抽取到的成本观测（4 条）。所以
+  `M_UNIT_MARGIN` 的读数**仍如实 missing**，界面上那一格没有任何变化——这是刻意的，
+  本批不动读数层（一条 `SRC_DERIVED` 的观测会改 `pig_readings._gap_status` 的判定，
+  见 §11.19.4 第 4 条那个坑）。派生值以什么身份进仓，等接线那一批一次决定。
+
+#### 11.22.7 证据载荷：成本格**要显式播种**（`pig_evidence` 只加不改）
+
+候选明细**天然零改动**：`_candidate` 用的是 `observation.to_dict()`（全部 `COLUMNS`）+
+`EVIDENCE_FIELDS`，所以新增的两列、`scope`、`metric_variant`、`period`、`source_level`、
+`is_estimated`、`paragraph`、`page`、`document`、`derivation`、候选 / preferred / `competing` /
+`lower_conflicts` **全都已经在**（§十九「不要另建第二套 evidence」在这一半是结构性成立的）。
+
+**但指标桶会漏，必须显式播种**：桶是从 `set(metrics) | series_names | _reading_metrics(state)`
+现算的，而 `_reading_metrics` 走的是**因子**。实测 002714 的 `_reading_metrics` 只有
+`{cost_advantage, full_cost, unit_margin}`——`cash_cost` 与 `fattening_cost` **一个都不在**
+（它们在 `FACTOR_METRICS` 里没有消费方），观测仓里也没有它们的观测。所以那两个格子
+**在载荷里根本不存在**，而「不存在的行」没法显示「未获取可靠公开数据」——它会显得像这一格
+从来不需要。改动是 additive 的两处：
+
+1. `COST_GRIDS` 的五个 `metric_id` 并进上面那个 `setdefault` 循环；
+2. 载荷新增 `cost_grids` 键，每条 = `{metric_id, metric_label, metric_variant, unit,
+   missing_text, preferred}`。`preferred` 取该 `(metric_id, variant)` 里**最新一期**那组，
+   用**已有的** `_newer_than` 比，不引入第二套排序；没有观测就是 `None`，**不许合成**，
+   也**不许**拿同指标另一个 variant 的值顶上。
+   `metric_label` 一律走**已有的** `_label_of()`（`MetricDef.display_name`）——
+   载荷 / 前端**不许自带第二份后端词表**。`MISSING_TEXT = "未获取可靠公开数据"` 也只在后端
+   维护一份，前端只读不写。
+
+`COST_GRIDS` 与实际注册的 5 格：`full_cost` 占**两格**（正身 `COMPLETE_COST_PER_KG` +
+旁证 `FULL_COST_COMPANY_DISCLOSED`）、`fattening_cost` / `cash_cost` / `weaned_piglet_cost` 各一格。
+
+**前端最小改动**（`static/research.js`）：
+
+* `pigNum(v, unit, missing)` 加第三个参数，缺值时渲染载荷给的 `missing_text`
+  （**只对这几格**，不改全局「数据缺失」措辞）；`!isFinite(n)` 也走缺失——
+  **不显示 0 / NaN / —**，一个 0 会被读成「成本是 0」；
+* `pigRows()` 在 `metrics` 循环后加一段遍历 `p.cost_grids`，推 `kind:'grid'` 行；
+  点击走**已有的** `loadPigEvidence`，不新建面板；
+* **判重从「按指标名」改成「按 (指标, 口径)」**（`pigPairKey`）：`full_cost` 在载荷里占两格，
+  按指标名去重会让第一格把第二格一起挡掉——公司明明披露了 11.7 元/公斤，页面上却写
+  「未获取可靠公开数据」，比缺一行糟得多。同一指标多行本来就是这张表的常态
+  （`pig_sale_price` 被两个因子各消费一次），口径列就是用来分开它们的。
+  这条是**无头探针**抓出来的：探针铺了一遍行表，发现新希望出现过两行一模一样的
+  「育肥成本 12.2 元/公斤」（store 那一支没记 `seenPairs`）。探针是**一次性验证**，
+  未入库为测试；真正的守卫是 `tests/test_pig_evidence.py` 里读源码文本的那几条契约测试。
+
+#### 11.22.8 §二十四 `price_position` —— 复验：零残留
+
+批 6 已按裁定改名 `sale_price_level`。本批全仓复验：
+
+| 位置 | 结果 |
+|---|---|
+| `*.py` / `*.js` / `*.html` / `*.css` | 仅 2 处**注释**在说明改名（`dimensions.py` 的组权重行、`factors.py` 的 factor 定义），**无一处活的键名** |
+| `research_stocks` 的 `attr_scores_json` / `category_scores_json` / `factor_analysis_runs.overview_json` | 0 处 |
+| `factor_snapshots.factor_id` | **80 行历史 `price_position`**（批 6 之前的旧快照）——按项目规则 #5/#7 **保留不动**，即「旧实验结果」 |
+
+#### 11.22.9 评分隔离——**实测**，不是推理
+
+1. **静态**：`rules.py` / `router.py` 一字未动；`factors.py` / `dimensions.py` 只被批 6 改过
+   （本批零改动）；`RULES_V1["pig"]["factor_curves"]` 仍为空；本批**没有**新开 `/api/meta` 指纹轴。
+2. **结构**：抽取器与派生器是**独立 CLI**，不接进 `state()`；`M_WEANED_PIGLET_COST` 只登记
+   （`MetricDef(..., factor_id=None)`），**没有加因子**；`FACTOR_METRICS` / `FACTOR_VARIANTS` /
+   `METRIC_GRIDS` / `GROUP_FACTOR_WEIGHTS` / `RESOLVER_METRICS` 一个字未改。
+3. **实测**：29 只与改前对拍——`total_score` / `primary_model` / `rule_version` /
+   `category_scores_json` / `attr_scores_json` / `data_completeness` **逐位相等**；
+   4 家猪企的 `pig.state()` 读数**逐位相等**；唯一差异是证据桶预期的三个新增
+   （`cash_cost` / `fattening_cost` / `weaned_piglet_cost`，本批显式播种的成本链）。
+   `pig_industry` 贡献 **29/29 = 0.0**（4 家猪企的 `category_scores_json` 的 `components` 里
+   没有任何猪相关键）。
+4. **线上库本批没有重跑任何一只**；`/api/meta` 的 `rule_source_dirty` / `router_source_dirty`
+   与 `rule_version` 待重启 8765 后复核（见 §11.22.11）。
+
+#### 11.22.10 库面与测试代价
+
+* **旧表结构改动：只有一处**——`pig_metric_observation` 加 `is_approximate` /
+  `extraction_confidence` 两列（`ALTER TABLE ADD COLUMN`，幂等，只加列不动数据）。
+* 行数：`pig_metric_observation` **3261 → 3265**（+4，就是那 4 条成本观测）。
+  `research_stocks`(29) / `research_snapshots`(264) / `pig_industry_series`(3817) 本批**一行未写**。
+  **如实记账**：`factor_analysis_runs`(199) / `factor_snapshots`(13885) / `dimension_snapshots`(796)
+  的当前值里有 **2026-09-29 02:03:51–02:05:34 的 20 行 run 是 8765 上的旧代码服务写入的**
+  （另有 00:41 的 1 行），**与本批无关**——证明方式：完整跑一遍 1440 条测试，前后这几个计数
+  **一字不变**（测试套件不写生产库）。
+* 测试 **1387 → 1440**（+53，36.9s 全绿）：新文件 `tests/test_pig_cost_core.py`（**48**，
+  含真夹具 `tests/pig_cost_fixtures.py`）+ `tests/test_pig_evidence.py` **+5**
+  （三个证据桶/载荷契约 + 两个前端契约）。**全部离线、不联网、不碰真库**；
+  夹具一律用**真报告原文片段**，合成夹具（区间、「近期」、元/斤、无主体限定、离题目标词、
+  远距离目标词）单列在 `SYNTHETIC` 里且键名带 `synth_` 前缀——混进真夹具会让人以为
+  本地语料里真出现过，那正是这一批反复在治的「看起来完全正常的数」。
+* `RULE_VERSION` 仍是 `SCORING_EXPERIMENTAL`；本批不改 `rules.py`，所以**理论上无需重启**，
+  但 8765 上跑的是旧代码，重启一次才能让 `/api/research/pig-evidence` 的 `cost_grids`
+  真正出现在 HTTP 侧。
+
+#### 11.22.11 三处**刻意偏离**计划字面（必读）
+
+1. **列名 `extraction_confidence` 而不是 `confidence`**：避与 `pig_readings.confidence`
+   在同一份 JSON 里撞车（§11.22.5）。
+2. **`COST_GRIDS` 的键在 `(metric_id, variant)` 上**，不是纯 `metric_id`：
+   所以它是**5 条**而不是 4 条——`full_cost` 的正身与旁证各占一格，而这两格一个有一个没有
+   （牧原 11.7 在旁证上），按纯 metric_id 判重会把有值的那格挡掉（§11.22.7）。
+3. **TARGET / RATIO 的触发收紧为「口径词命中，或目标/占比词贴着成本二字」**，理由改为
+   `_by_proximity` 的三档写法。原因是实测：新希望那份年报 119 条拒答里有 **10 条**被判成
+   「这是目标不是事实」，而它们是「对冲**计划**销售生猪，防范生猪销售成本及利润受损」
+   「瘦肉率 63%，降低育种成本」这类句子——一个字都没提过成本数。**两种都拦，但拦的理由
+   要照实说**：把「公司拿占比糊弄」与「只是恰好同句、宁可拒答」写成同一句话，
+   读拒答清单的人就分不出哪条该去抠原文。
+
+#### 11.22.12 未决（接 §11.21.9）
+
+1. **成本链仍未接进评分**：本批只把事实抓进仓 + 派生（不落库），`M_FULL_COST` 的正身、
+   `M_UNIT_MARGIN`、`M_COST_ADVANTAGE` 在读数层**仍是 missing**。接线那一批要一次决定三件事：
+   派生值以什么身份进仓、`GAP_REASONS` 怎么改、要不要为「子集口径的单位毛利」单开一格。
+2. **4 家的 `cash_cost` 一个字都没有**：不是没抽到，是**公司根本没披露**（全语料「现金成本」
+   零出现）。这一格要变成有值，靠的是新数据源（业绩说明会 / 投资者关系记录表），
+   而仓库里**没有对应的 provider**——那是另一个批次的活。
+3. **`fattening_full_cost_per_kg` 只有一家**（新希望 2025-12），且是子集口径：
+   中位数门槛（`PEER_MIN = 3`）本批永远过不了。**不放宽**——那正是这一格存在要防的事。
+4. **`pig_observations` 仍没有独立测试文件**（§11.19.6 的老账，本批仍未补；
+   新加的两列由 `tests/test_pig_cost_core.py` 间接覆盖）。
+
+---
+
+### 11.23 批 8：猪企核心经营数据**收敛为三项** + 首次研究缺失补录（**仍不改任何评分权重**）
+
+批 5~批 7 是**加**：31 格 → 32 格、观测仓 32 列、`pig_cost_core` 1183 行。批 8 是**减**：
+猪企核心经营数据正式收敛为**三项**，其余养殖指标一律降级为扩展信息。核心关系是
+
+```
+单位利润 = 销售均价 − 完全成本          盈利能力 ≈ 单位利润 × 出栏规模
+```
+
+#### 11.23.1 三项：**一个 metric_id 都没新建、一个都没改名**
+
+| 收敛项 | 复用的 metric_id | 落格（variant） | 单位 |
+|---|---|---|---|
+| 销售均价 | `pig_sale_price` | 单月 `monthly_commodity_price` / 区间 `annual_commodity_price` | CNY/kg |
+| 完全成本 | `full_cost` | **旁证 `FULL_COST_COMPANY_DISCLOSED`（正身永不碰）** | CNY/kg |
+| 出栏量 | `hog_sales_volume` | 单月 `monthly_heads` / 区间 `annual_sales_heads` | **万头** |
+
+三项的三张 `MetricDef`、三个 `scope`、两个派生入口全部**复用批 5~7 的既有物**，
+新文件只有 `research/pig_core.py`（596 行）。**没有新建平行数据模型**：人工补录直接进
+`pig_metric_observation`，**没有** `manual_pig_data` / `manual_cost` / `manual_metrics` 表。
+
+**降级 ≠ 删除**：`PSY` / `MSY` / 料肉比 / 出栏均重 / 断奶仔猪成本 / 现金成本 收进
+`research/industry/pig.py` 的 `EXTENSION_METRIC_IDS`——不删库、不删抽取逻辑、
+**不作为首次研究完整性要求、不触发人工补录、不因 missing 报错、不为覆盖率加 parser、
+不进核心卡片**。`METRIC_GRIDS` / `FACTOR_METRICS` / `FACTOR_VARIANTS` / `GAP_REASONS`
+一个字未改（`test_extension_metrics_missing_never_triggers` 钉住「非三项即扩展」）。
+
+#### 11.23.2 落格表与取值域（**录入校验，不进 `RULES_V1`**）
+
+`CORE_METRICS` 是一张登记表（`metric_id` / 月口径 variant / 区间口径 variant / `scope` /
+取值域 / `derive_grid`），**单位一律取自 `MetricDef.unit_of(variant)`**，不写第二份单位表。
+取值域与期间正则放模块常量：均价/完全成本 **0.5–100 CNY/kg**、出栏量 **0.001–10000 万头**；
+期间形状 `YYYY-MM` / `YYYYA` / `YYYYH1,2` / `YYYYQ1..4` / `YYYY`。
+
+**这些是录入校验不是评分阈值**，所以不进 `RULES_V1`、不新开 `/api/meta` 指纹轴——
+照批 7 `MAX_VALUE_GAP = 45` 的先例（§11.22.11）。它们同时是**量纲防错**：把「万头」当「头」填、
+把元/斤当元/公斤填，在录入时就被拒并给出带单位的理由。**单月期间额外校验 01–12**：
+`pig_premium.MONTH_RE` 只校验形状，`2026-13` 能穿过去（`_month_period` 补范围检查）。
+
+#### 11.23.3 新增「人工确认」级 `LM`（排在 L2 月报之后）
+
+`SOURCE_LEVELS` 插入 `LM = manual_verified`，位置在 L2 月报之后、L3 业绩说明会之前：
+**定期报告 / 月报的自动值优先，人工值排在它们后面**（用户裁定）。
+`LEVEL_RANK` / `LABEL_BY_LEVEL` 自动跟随；`ESTIMATED_LEVELS` **不含 LM**（人工录入不是推算，
+标成推算会逼着它写 `derivation` 之外的东西）。`SOURCE_PRIORITY` 7 → **8**
+（`test_pig_industry.py` 的计数断言同批更新）。
+
+#### 11.23.4 `check_errors` 第 4 条**换内容**，条数仍是**五条**
+
+原文是「人工录入必须有文档出处——『手填』在用户那里是被明令禁止的」。批 8 用户**新建了
+官方的人工补录入口**（来源不是强制项），所以这条从「必须有出处」改成三件更准的事：
+
+```
+manual_entry ⇒ source_type == SRC_MANUAL          （必须可识别为人工，不许假装是抽取的）
+            ∧ (document / source_url / source_name) 至少有一个
+              （出处可以没有，但「没有出处」这件事本身要说出来）
+            ∧ period 非空                            （§七：禁止保存无期间的成本）
+```
+
+**这是把一条规则换成三条判据，不是加规则**——规则数仍是五条（`pig_observations.py`
+的 docstring 同批更正；原先误记为「六条」）。
+
+#### 11.23.5 载体：**不加任何持久化状态**，「只弹一次」是条件本身的推论
+
+| 接口 | 改动 |
+|---|---|
+| `POST /api/research/analyze` | 调 `analyze` **之前**只读一次 `db.get_stock`：`first_time = row is None`。为真时算一次 `pig_core.pending_prompt`，非空就把载荷挂到响应上。**`analyze` 本身零改动**——score / route / 落库全不变 |
+| `GET /api/research/pig-evidence` | 载荷**只加两个键**：`is_pig_company`、`pig_core`（= `snapshot`） |
+| `POST /api/research/pig-core` | 人工补录；带 `observation_hash` = **改**（先 `forget` 再 `append`）。**一律 HTTP 200**，用 `ok` 表达失败——`api()` 助手在非 2xx 时丢弃字段级错误 |
+| `POST /api/research/pig-core/delete` | 服务端**拒绝**任何非 `manual_entry` 或不属于该 code 的哈希 |
+
+**「只弹一次」不需要状态机**：弹窗只挂在**那一次 analyze 的响应**上，而 `first_time` 的
+条件是「库里还没有这一行」——落库之后**永久为假**。所以刷新页面 / 重开详情 / 重新评分 /
+重启服务 / 重跑 evidence / 审计完成后服务端自己那次 `analyze`（`audit_job._audit_one`）
+全部不满足。〔暂不填写〕= 前端直接关掉，**不发任何请求**，股票早已由那次 analyze 正常落库。
+已有猪企不自动弹，但详情页有极轻量的【补充核心经营数据】入口。
+**实测**：`300498` / `002124` / `002385`（不在库）→ 弹并列出三项全缺；`002714`（在库）→ `None`；
+`600519`（非猪企）→ `None`。
+
+#### 11.23.6 单位利润**不新增派生入口**
+
+直接调批 7 的 `pig_cost_core.derive(conn, code)`（只读，一行不写），取其中的 `unit_margin`
+与 `skipped` 理由原文。期间不匹配 / 口径不可比 / 成本侧不是直接披露（**人工完全成本就是
+这条**）→ 单位利润 missing + **后端给的理由原文**，不做插值、不做公斤口径换算、不引出栏均重。
+人工完全成本**永不落正身**：`canonical_full_cost` 定义一字不改，**真库实测正身
+`COMPLETE_COST_PER_KG` 有值家数 0/29**（旁证 `FULL_COST_COMPANY_DISCLOSED` 1/29）。
+
+#### 11.23.7 本批实测出的**三个真 bug**（都出在核心卡片这一层）
+
+**① 卡片显示的是最老一期。** `pig_core._obtained` 用 `_newest_first`（「**降序**排序用的
+键」，空期排最后）却漏了 `reverse=True`，升序排出「最老一期在前」——`002714` 的卡片显示
+**2023-01~02 的均价 14.49**，而同一张卡片上的单位利润 `-2.01 @ 2026-06` 是用 2026-06 的数
+算的，两个数**对不上账**。同一个键在 `_unit_margin`（`reverse=True`）与
+`pig_readings._anchor`（`max` 里）都是降序用的。
+
+**② 修完 ① 之后暴露出来的更重的一条：卡片会把「推算值」当头版数。** 只按期排的话，
+`002714` 出栏量最近三期全是 `derived`（**749.7 @2025-07**，`is_estimated=1`、
+`is_direct_disclosure=0`），而公司自己最后一期**披露**是 857.8 @2024-12；新希望更明显——
+**136.07（推算）对 180.89（披露），差 24%**。一个推算出来的合计数摆在「核心经营数据」上，
+正是这套系统反复在治的「看起来完全正常的数」。修法是给排序键补上**来源优先级**：
+`(_level_first(source_type), _newest_first(period), variant 声明序)` + `reverse=True`，
+与 `SOURCE_PRIORITY` / `pig_readings._anchor`（`max` 里先 `-level_rank`）**同一把尺子**。
+实测只有出栏量受影响（均价与成本的读数都已是 L1/L2），修后 `002714` = 857.8 @2024-12、
+`000876` = 180.89 @2025-12，都是公司披露值。
+
+**③ 改过值之后再拿旧哈希去删，理由说错了。** `_hash` 含值，所以**改一次值就换一个观测
+标识**——拿旧哈希去删是很容易发生的（两个标签页、或上一次的回执还捏在手里）。原来的错误
+文案只有一句「不是这只股票的人工补录（人工入口不能改自动抽取的数据）」，等于系统在指控
+用户想改自动数据，而库里那条人工行早就被替换掉了。现在先看哈希在不在库里，分两句说。
+浏览器实测复现并复核：`{"ok":false,"errors":["观测 86a5… 已经不在库里了（改过一次值就会
+换一个新的观测标识，请用列表里重新给的那个）"]}`。
+
+**为什么之前没测出来**：`missing` 只看「有没有」，与「选了哪一期、哪一级」无关的测试全绿；
+卡片长什么样、DOM 里那行字是什么，没有任何测试断言过（`research.js` 在测试里从不执行）。
+现在 `TestShowsTheNewest` 五条钉住（最新期胜出 / 空期排最后 / 同期按 `variant_names` /
+**披露值胜过更新一期的推算值** / 人工确认级夹在月报与业绩说明会之间）。
+
+配套的显示层收尾（`research.js` 的 `pigReason`）：后端理由里的 Markdown `**` 与硬切 60 字
+会露出星号、把单词拦腰截断（实测「…是 weaned_piglet_cost / co」）——只去星号 + 超长加省略号，
+悬停那一份不截断。**不改后端那句话、不重算任何口径。**
+
+#### 11.23.8 评分隔离——**实测**，不是推理
+
+1. **静态**：`rules.py` / `router.py` / `factors.py` / `dimensions.py` / `engine.py` 本批**一字未动**；
+   `RULES_V1["pig"]["factor_curves"]` 仍为空；**没有**新开 `/api/meta` 指纹轴。
+2. **结构**：`pig_core.py` 是**只读 + 人工入口**，不接进 `state()`、不改 Router threshold、
+   不写死最终值、`PEER_MIN` 仍是 3。
+3. **实测（29 只逐位对拍）**：`data/_t_before.py` / `_t_after.py`（跑完已删）比对
+   `total_score` / `primary_model` / `secondary_model` / `data_completeness` / `rule_version` /
+   `industry` / `audit_status` / `category_scores_json` + 4 家 `pig.state()` 读数 + 2 处
+   `pig_cost_core.derive` → **JSON 逐位相等**（`identical: True`）。
+4. **线上库一行未写**：核对前后 `pig_metric_observation` 3265 行、`manual_entry` 0 行、
+   `research_stocks` 29 行**一字不变**。新路由探针（`data/_t_routes.py`，跑完已删）只发
+   **必然被校验拒收**的载荷，且**不启 `app.py`**（那会连带 notifier 与 audit worker，
+   等于给用户的机器再挂一份会写库的进程），只把 `run_server` 的路由拉到 8766。
+5. **无头浏览器实测（真 DOM，不是源码文本断言）**：探针页 `static/_probe_pig_core.html`
+   （**验完已删**）用 `chrome --headless=new --dump-dom` 渲染，跑的是**真 `research.js`**。
+   验到：卡片渲染三项 + 单位毛利、`＋ 补充核心经营数据` 按钮在、Dialog 只给**缺的那一项**
+   输入框、**没漏出任何一个数据库字段**（`observation_hash` / `source_level` /
+   `extraction_method` / `metric_variant` / `scope` / `confidence` / `provenance` 全不在
+   DOM 里）、【暂不填写】只关闭不发请求。
+   **写路径也在浏览器里真跑了一遍**（保存 → 改 → 删 → 冲突）：保存回执 `ok:true`；
+   改一次 → 换新哈希、值更新；拿旧哈希删 → 拒绝且**理由准确**；拿新哈希删 → 成功、缺项复原；
+   冲突用例（人工 10.96 对自动 L2 的 10.46）→ `conflict_note` 带上「同期同口径已有 1 条其它
+   来源的观测（L2，值：10.46）——两条都保留，**没有覆盖**」，且**卡片上的自动值仍是 10.46 @L2**。
+   这一遍**服务的是 `research.db` 的副本**（`data/_t_serve.py` 先把真库复制到临时文件再把
+   `research_db.DEFAULT_PATH` 指过去，跑完连副本一起删），所以「保存 / 改 / 删」这些**真写库**
+   的路径走通了，真库仍然 3265 / 0 / 29。**没有重启 8765**（见下）。
+6. **`/api/meta`**：`rule_source_dirty` / `router_source_dirty` 均为 `false`，
+   `rule_version` 仍 `SCORING_EXPERIMENTAL`。**本批不改 `rules.py`，所以指纹轴无需重启**，
+   但 8765 上跑的是 09-28 19:20:37 启动的旧进程，**新加的两个 POST 路由必须重启后才有**
+   ——`taskkill` 对该进程返回「拒绝访问」（提权/会话上下文不同），所以**重启这一步留给用户**：
+   关掉旧窗口、重跑 `run.bat`（CRLF）。在重启之前，**页面上点【保存】会 404**（JS/CSS 是
+   从磁盘读的、已经是新的，缺的只有那两个路由）。
+
+#### 11.23.9 库面与测试代价
+
+* **旧表结构改动：零**。`pig_metric_observation` 不加列、不加表；`research_stocks`
+  **不加「弹过没」列**（`test_pig_core.py` 断言表里没有任何 `manual|prompt|asked|pig_input` 列，
+  库里没有 `manual_pig|manual_cost|manual_metric` 表）。
+* 测试 **1440 → 1481**（44.2s 全绿）：新文件 `tests/test_pig_core.py`（**39**）+
+  `tests/test_pig_evidence.py` **+2** + `tests/test_pig_industry.py` 计数断言更新。
+  **全部离线、不联网、不碰真库**（临时库 + `patch.object(research_db, "DEFAULT_PATH")`）。
+  **如实记账**：`test_pig_core.py` 的 39 条里有 **7 条是浏览器实测发现缺陷之后补的**
+  （`TestShowsTheNewest` 5 条 + 旧哈希理由 1 条 + `pigReason` 1 条）——先有测试再写代码的
+  那部分盖住了契约，**没盖住「卡片上到底写了什么字」**，那正是这一批 bug 的藏身处。
+* 界面：`static/research.css` **未改**（Dialog 复用 `style.css` 的既有 modal/form 类），
+  只改 `static/research.js` + `static/research.html`；文案一律来自后端载荷，
+  **前端不含「猪企」二字**（`test_no_second_copy_of_the_cohort_label` 钉着）。
+
+#### 11.23.10 刻意偏离与未决
+
+**刻意偏离**：①取值域与期间正则**不进 `RULES_V1`**（录入校验 ≠ 评分阈值，§11.23.2）；
+②`check_errors` 第 4 条**换内容不换条数**（§11.23.4）；③`MISSING_TEXT` **一份定义两处引用**
+（`pig_evidence.MISSING_TEXT` 改为 `pig_core.MISSING_TEXT` 的别名，不新建第二份词表）。
+
+**未决**：①**自动获取对新股票事实上取不到任何一项**——现成抽取器全是**离线 CLI**，
+跑在已缓存的文档上，`engine.analyze` 与新增流程**不抓猪数据**，所以新加的猪企三项全缺
+（`300498` 实测），这不是 bug 是「取不到就问你」的如实结果，但意味着**人工补录在首次研究里
+是常态而不是补救**；②卡片上三项各自带自己的期间，单位利润带它自己的期间——三者可能不是同一期
+（`002714` 现在显示 均价 2026-08 / 成本 2026-06 / 出栏量 2024-12，而利润 @2026-06 用的是
+2026-06 的均价 9.69），故用户**不能**用卡片上的两个数直接减出利润。要不要把「利润实际用到的
+那两个数」一并显示，留待接线那一批定；③**出栏量的「合计 vs 商品猪」两个口径仍然并存**：
+本批收敛的是 `hog_sales_volume`（生猪合计，含仔猪与种猪），`commodity_hog_sales_volume`
+被 `capacity_delivery` 消费、本批**一个字未动**；④三项仍只是研究数据，不进评分
+（接 §11.22.12 的未决 1）。
+
+**后续批次对上面两条的处置**：未决②③都在**批 9** 里收掉了——三项的第三项换成
+商品猪口径（§11.24.2），并新增一格「每头利润 / 估算总利润」（§11.24.5）。
+未决①（自动取不到 → 人工补录是常态）**仍未决**，见 §11.24.10。
+
+---
+
+### 11.24 批 9：猪行业数据面向「只要商品猪」收敛 + 单位利润接通出栏量（**唯一一处评分结构改动：摘掉 `price_premium`**）
+
+批 8 把猪企核心收敛成了三项，但**收敛只发生在流程层，没有发生在展示层与数据面**：
+猪行业页仍是 29 只公开的 tab；页面下半张表把整个审计面铺在主视区；真库 33 个登记指标里
+**21 个一行数据都没有**；行业序列 3817 行里 **2524 行（66%）是仔猪价与白条价**，而这两个量
+**没有任何 factor 消费**。批 9 把「我们只管商品猪」这句话落到三处：**显示什么、抓什么、
+算什么**。
+
+用户原话（两条）：
+
+> 「猪行业数据已经成为一个公共的 tab 了，实际上这个只需要针对猪企开放，当前的猪行业数据
+> 对我们有用的其实只有出栏量，售价周期位置，生猪价格，商品猪均重统一采用 120kg，屠宰和
+> 仔猪不计入我们的估算中，我们只管商品猪即可，现在计算的东西太多了……」
+> 「地区溢价不需要了，因为我们有销售均价，我可以填这个，有了这个还有完全成本完全够用。」
+
+#### 11.24.1 六条用户裁定（本批不再重议）
+
+| # | 问题 | 裁定 |
+|---|---|---|
+| 1 | 商品猪均重 | **用 120kg 算**：单位利润(元/kg) × 120 = 每头利润，再 × 出栏量 = 估算总利润 |
+| 2 | 人工值 vs 自动月报 | **保持现状**：L1 报告 > L2 月报 > LM 人工确认，人工只补缺、不覆盖自动 |
+| 3 | 估算总利润的出栏量口径 | **只认商品猪**；缺了就算 missing（**不做合计口径兜底**） |
+| 4 | 核心第三项 | **换成商品猪口径** `commodity_hog_sales_volume` |
+| 5 | 地区溢价 `regional_price_premium` | 不需要了，**连评分位置一起摘掉**（本批唯一的评分结构改动） |
+| 6 | 售价周期位置 | **不做**（现在根本不存在，做就是新增计算，与「计算太多」反向） |
+
+#### 11.24.2 第三项换成商品猪口径——`CORE_PIG_METRIC_IDS` 与 `CORE_METRICS` 同批改
+
+| 项 | 旧 | 新 |
+|---|---|---|
+| metric_id | `hog_sales_volume` | **`commodity_hog_sales_volume`** |
+| scope | `SCOPE_ALL`（`company_live_hog_all`） | **`SCOPE_COMMODITY`（`company_commodity_hog`）** |
+| 月 / 区间 variant | `monthly_heads` / `annual_sales_heads` | `monthly_heads` / **`annual_heads`** |
+| 界面标签 | 出栏量 | **商品猪销量**（`MetricDef.display_name`，一字未改、本来就是这个） |
+
+两处声明**必须同批改**，它们是「三项」的两份写法：`research/industry/pig.py` 的
+`CORE_PIG_METRIC_IDS`（展示 / 白名单那一份）与 `research/pig_core.py` 的 `CORE_METRICS`
+（人工补录真的往库里写的那一份）。落格与 `METRIC_GRIDS` 里既有的
+`(M_COMMODITY_HOG_SALES_VOLUME, "annual_heads") → (SCOPE_COMMODITY, None)` **逐字一致**，
+有测试钉住（不一致就是「人工补录把数写进了另一格」）。
+
+**对评分的实际影响：无。** `capacity_delivery` 消费的**本来就是**
+`M_COMMODITY_HOG_SALES_VOLUME`（`pig.py:748`）——它读库、不读 `CORE_METRICS`。
+
+**如实说明后果**：`001201` / `002100` 库里的商品猪口径**一期都没有**（只有合计口径且
+`value=None`），这两家的核心出栏量格变 missing，【补充核心经营数据】会问一次。
+
+#### 11.24.3 展示白名单 `DISPLAY_METRIC_IDS`（**白名单，不是黑名单**）
+
+主视区只留五项：三项核心 + `national_pig_price`（行业对比）+ `unit_margin`（派生的那一格）。
+
+选白名单而不是「列一串退役 id」的理由是**方向**：这套系统的既定方向是停止扩张，
+所以「新加一格默认不显示、要显示得显式写进来」比「新加一格默认显示、要藏得记得去拉黑」
+更符合意图——后者会在每次加格子时重新把页面撑大一遍。
+
+**退役展示不是删除**：观测、抽取、证据、下钻入口一条没少。
+`pig_evidence.build()` 的过滤是 `visible = None if metric_id else set(DISPLAY_METRIC_IDS)`
+——**点名 `metric_id` 时不过滤**，那是证据下钻的路（界面上点开某一行看它的全部候选），
+不是主视区。把下钻也挡掉，「不再显示」就变成了「查不到」。
+
+同时补了**播种**：核心三项要显式进 `wanted`。第三项换口径之后，消费它的只有 display_only 的
+`capacity_delivery`，实测载荷里**根本长不出这个桶**——核心卡片上写着「未获取可靠公开数据」、
+下面那张表里连这一行都没有，卡片与表是同一个数的两种排版，这种自相矛盾正是本批要防的。
+
+**发货前那一步也要过滤**（`shown = _visible(metrics, visible)`，载荷里 `"metrics": shown`）。
+这是本批**第三个实测出来的真 bug**，而且只有无头浏览器探针逮得住：
+
+* 上面那处 `wanted &= visible` 挡的只是「**新播种**」，而桶主要是
+  `obs.group(rows)` **从观测长出来的**（`pig_evidence.py` 第 301 行）。退役指标在
+  **真库里有观测**（`pig_metric_observation` 里 002714 就有均重 / 种猪销量 / 屠宰量 /
+  仔猪销量 / 售价溢价 / 合计口径出栏量六项），于是它们照旧各占一行「读数不消费」。
+* 实测 002714：白名单 5 项里只有 4 项有读数行，**另有 7 行退役指标铺在主视区**。
+  这正是用户那句「现在计算的东西太多了」——批 9 要收敛掉的正是这 7 行。
+* **测试为什么看不见**：夹具里退役指标**一条观测都没有**，桶根本长不出来，
+  `test_an_empty_grid_still_gets_a_bucket` 末尾那句 `assertNotIn` 就一直是绿的
+  （与 §11.23.7 记的是同一种盲区）。已补
+  `test_a_retired_metric_with_observations_stays_out_of_the_main_view`
+  ——先给退役指标造一条观测，再断言三件事：主视区没有它、点名取它必须有、**值还对**。
+  这条测试在加上过滤之前**是红的**（实测 `hog_slaughter_volume unexpectedly found`）。
+* `_cost_grids(metrics)` 用的是**未过滤**的那份（它对缺桶回落空骨架），
+  所以那一行必须放在它之后、且只改**发出去**的那一份；`counts["metrics"]`
+  同步改成表上真正有几行（页脚那句「指标 N 个」要与表一致）。
+
+#### 11.24.4 停抓仔猪价与白条价——**三处必须同时改**
+
+| 处 | 文件 | 改法 |
+|---|---|---|
+| 抓侧 | `pig_industry_series.Yangzhu360Provider.series_types` | 只剩 `national_pig_price → (national_avg_price, "pigprice")`；CLI dump 循环同步 |
+| 读侧 | `pig_readings.series_targets` | 只剩全国价 + 映射表里出现过的区域价 |
+| 装配 | `pig_evidence._series_metrics` | 取**两者交集**（`SELECT DISTINCT metric_id` ∩ `series_targets`） |
+
+**缺一处就藏不住**：只改抓侧的话，库里已抓的 2524 行仍会被捞出来铺到页面上，而
+`_series_of` 的 `wanted={None}` 会让全国序列无条件通过——「已经不抓了」就成了一句空话；
+只改读侧的话，下一次抓取又把它们补回来。
+
+`national_pig_price` **不动**：它在评分体系里有正式位置（`pig_product_price` /
+`sale_price_level` 的基准）。历史数据**一行不删**（用户长期指令第 10 条）——
+`test_the_retired_series_stay_in_the_store_and_out_of_the_payload` 同时钉「库里还在」
+与「载荷里没有」，只钉后者的话，把历史删了那条测试照样绿。
+
+#### 11.24.5 每头利润 / 估算总利润（`pig_core._estimated_profit`，**纯研究、不进评分**）
+
+用户要的那座桥：单位利润是元/**公斤**，商品猪销量是**头**，两个量纲本来接不上，
+硬乘出来的数在界面上与正确的那个长得一模一样。桥就是
+`RULES_V1["pig"]["commodity_hog_weight_kg"] = 120.0`（**我们写下的一个假设**，
+不是任何一家公司披露的数）。
+
+```
+每头利润(元/头)   = 单位利润(元/kg) × 120(kg/头)
+估算总利润(亿元)  = 每头利润(元/头) × 出栏量(万头) × 10000(头/万头) ÷ 1e8(元/亿元)
+```
+
+三条纪律，每一条都有测试：
+
+1. **量纲每一步写出来**，`derivation` 里留下 `per_head` / `value_yuan` / `value_yi`
+   与整条单位链——界面上看到一个 −15.02 时，链子中间那几个数要能在载荷上核对。
+2. **期间必须逐字相等**才乘（照批 8 §十一同一条理由）：2026-06 的单位利润乘 2026-08 的
+   出栏量得到的是一个期间错配的总利润，而它与正确的那个长得一模一样。
+   **不插值、不累加、不用相邻期近似。** 缺哪一半要**分开说**——「缺单位利润（等成本与售价
+   配到同期）」与「缺那一期的出栏量（等那一期的月报）」下一步动作完全不同。
+3. **出栏量只认商品猪口径**，且**自己上 scope 那把锁**：`_obtained` 只看指标 / 状态 / 值、
+   不看 scope，库里若有一条挂了商品猪 id、scope 却是合计口径的错行，它会被择优挑中然后
+   被 120 乘成一个看起来完全正常的总利润。缺了就 missing，理由里**写明为什么不拿合计口径顶**
+   （合计含仔猪与种猪，仔猪只有十几公斤，乘出来的总利润会平白变大）。
+
+**取的是「单位利润那一期」的出栏量，不是卡片上显示的那一期。** 这两者常常不是一期：
+卡片按「来源级别优先、再比期间」显示最新一期，而单位利润由成本决定、停在成本那一期。
+按卡片那一期去乘会得出「两期不是同一期」——而库里明明躺着那一期，那句话就成了一句假话
+（这正是本批实测抓到并修掉的一个 bug，见 §11.24.8）。
+
+**不进评分**：`pig_core` 的所有产物本来就不在评分路径上。`_estimated_profit` 是**纯函数**，
+不读库——它的两个输入就是 `snapshot()` 里已有的那两份，所以卡片上那三个数不可能来自两次
+不同的判断。
+
+**实测**（真库 `002714`）：均价 9.69 @2026-06 − 完全成本 11.7 @2026-06 = 单位利润 **−2.01 元/kg**；
+商品猪销量 **622.7 万头** @2026-06 → 每头利润 **−241.2 元**、估算总利润 **−15.02 亿元**
+（`derivation` 里 `value_yuan=-1501952400.0000`）。`000876` 有 2026-01~08 的商品猪销量、
+没有成本 → 缺单位利润，理由里列出「库里的商品猪销量有 2026-01…2026-08 这几期」；
+`001201` / `002100` 两样都没有 → 缺单位利润且不追加「不拿合计口径顶」那一句（因为确实一期都没有）。
+
+`commodity_hog_weight_kg` **进 `RULES_V1`**（它决定一个显示出来的数，应当随规则一起被
+指纹住），**不新开 `/api/meta` 指纹轴**；它**不是阈值**，所以不进阈值段。
+
+#### 11.24.6 摘掉 `price_premium`（**本批唯一的评分结构改动**）
+
+`price_premium`（售价溢价 = 区域溢价）此前是 `GROUP_PIG_INDUSTRY` 六格权重里的 `0.10`。
+用户裁定不要这一格（「有销售均价 + 完全成本完全够用」），于是：
+
+* `research/industry/pig.py`：`FACTOR_METRICS` / `FACTOR_VARIANTS` 里的声明删掉；
+* `research/factors.py`：`FactorSpec("price_premium", …)` 整块删掉；
+* `research/dimensions.py`：`GROUP_FACTOR_WEIGHTS` 删该项，**剩下 5 格按原比例放大**
+  （各自除以 0.90，即仍按 5:3:4:3:3 份）——**去掉一个因子不该顺手改掉其余因子之间的
+  相对轻重**，那是另一件事、得单独论证。写成算式而不是小数，是为了让「这是归一的结果」
+  留在代码里：四个小数会让下一个读的人以为它们是新拍的。
+
+| factor | 旧 | 新 |
+|---|---|---|
+| `margin_position` | 0.25 | **5/18** |
+| `sale_price_level` | 0.15 | **3/18** |
+| `supply_contraction` | 0.20 | **4/18** |
+| `cost_advantage` | 0.15 | **3/18** |
+| `capacity_delivery` | 0.15 | **3/18** |
+
+**摘的是这一格因子，不是它的数据**：`M_REGIONAL_PREMIUM` 的观测、派生与 `GAP_REASONS`
+一条没删，`METRIC_GRIDS` 那一行也**仍然要留**（它锁的是**指标自己的口径**，与那一格还有没有
+factor 消费无关）。它的 `catalog_metric_id` 由 `"price_premium"` 改成 **`None`**
+（降为「**只登记**」，与 `M_HOG_SLAUGHTER_VOLUME` 同处境）；`metric_catalog.py` 里那条
+`MetricSpec` 删掉——目录留着一个不再存在的分量，只会让「目录和实现对不上」的检查失效。
+要恢复的话，把因子连同权重那一格一起加回来（权重需重新归一），不是把注释解掉。
+
+#### 11.24.7 tab 门控：两套「是不是猪企」的判据暂时并存
+
+前端「要不要给这个 tab」原先只能靠 `cohort`（`industry_margin.COHORTS["pig"]`，4 个显式成员），
+而补录弹窗用的是 `pig_core.is_pig_company`（peer 组 + 已建档成员表，**更宽**）。两把尺子并存
+会造出一个自相矛盾的状态：**弹窗问你这只新股票的猪价，页面上却没有这个 tab**。
+
+做法：`engine._pig_mark` 在**列表**（`_stock_payload`）与**详情**（`_detail_payload`）里
+各补一个 `is_pig_company`（纯查表，零额外 IO），前端只认它一个。`cohort` / `cohort_label`
+原样保留（行业毛利那一条链还在用）。前端侧：
+
+* **`TABS` 数组本身不动**（它答的是「有哪些页」，测试钉着它必须含那个字面量），
+  过滤只发生在 `renderTabs()` 渲染的那一刻；
+* `normalizeTab()` 在 `renderTabs()` / `renderDetailBody()` / `renderTab()` 三处调用：
+  URL 直达（`?tab=猪行业数据`）或上一只股票留下的 tab，在**渲染之前**回落到「概览」
+  ——否则这一页会白发一次 `pig-evidence` 请求，页面上还会先闪一下只有那几只股票才有的表。
+
+**两套判据的真正合并是后续项**（见 §11.24.10）。
+
+#### 11.24.8 评分隔离——**实测**，不是推理
+
+1. **29 只逐位对拍**（`data/_t_before.py` / `_t_after.py` / `_t_bucket.py`，**跑完已删**）：
+   用改前 `engine.freeze_market` 冻好的**同一份输入**重跑（`MODE_COMPARE` = 零写），
+   `total_score` / `data_completeness` / `template*` / `primary_model` / `route_status` /
+   `dimensions` / `industry` / `rule_version` → **0 处不同**；组内**进分数**的四个字段
+   （`score` / `effective_declared_weight` / `applicability_multiplier` / `contribution`）
+   → **一处没变**（该组全是 display_only，权重根本不进分母）。
+   差异共 **340 处，逐条分类后 100% 落在允许的三类**：338 处是五个 factor 的
+   `declared_weight` / `declared_share` 元数据 + `price_premium` 那格消失 + `factors/len`
+   19→18，另有 2 处（`000876` 的 `excluded_from_score/len` 19→18、
+   `not_applicable_factors/len` 18→17）同样是「少了一格」。
+   **都是「表变短了」，不是「分变了」。**
+2. **本批实测出的两个真 bug**（都在阶段 C）：
+   **①** `_estimated_profit` 第一版从**卡片显示的最新一期**取出栏量，于是给 `002714` 报出
+   「两期不是同一期」——而库里明明躺着 2026-06 那条 622.7，那句话是**假话**。修法是改成
+   接收全部记录、按 `period == unit_margin["period"]` 过滤后再用 `_obtained` 择优
+   （不另写第二套排序）。**②** 缺口分支里留了一段死代码（`if "单位利润" not in lacks: pass`），
+   重写成「缺单位利润」与「缺那一期出栏量」两个**分开的**分支。
+   另有一处**自己写的注释里有一个假声明**（说 `regional_price_premium` 登记在
+   `metric_catalog` 里）——核实后改成「照旧在 `industry.pig` 的 `METRIC_DEFS` 里；
+   本模块从来不登记那些指标名」。
+3. **线上库一行未写**：核对前后 `pig_metric_observation` **3265** 行、
+   `pig_industry_series` **3817** 行（`national_pig_price` 1293 / `piglet_price` 1262 /
+   `white_meat_price` 1262）、`pig_bulletin_cache` 120 行、人工补录 **0** 行（`data/_t_rows.py`，
+   跑完已删）。**注意**：人工补录不是一个独立的表（库里没有 `pig_manual_entry`），
+   它是 `pig_metric_observation` 里 `extraction_method='manual_entry'` 的行。
+4. **`/api/meta`**：本批不改阈值 / 曲线 / Router，指纹轴无需重启；`rule_version` 仍
+   `SCORING_EXPERIMENTAL`。
+5. **无头浏览器探针**（`data/_t_probe.py` + `static/_probe_pig_tab.html`，**跑完已删**）：
+   把**真库只读导出**的载荷（`list` 29 只 / `detail` 002714 与 002129 /
+   `pig-evidence?code=002714&candidates=0` / 最小 `meta`）喂给**真的 `research.js`**
+   （`python -m http.server 8791` 起来，因为 `research.html` 里是 `/static/research.js`
+   绝对路径，`file://` 加载不到；**http URL 是 ASCII，所以不踩中文路径进 argv 那条**），
+   `chrome --headless=new --dump-dom` 渲染后逐条查 DOM——**19 条断言全过**：
+
+   | 组 | 查什么 |
+   |---|---|
+   | 非猪企 002129 | tab 里没有「猪行业数据」（9 个 = `TABS.length - 1`）、直达该 tab 会**回落**到概览、回落之后 `pig-evidence` **一次都没发**、DOM 里没有核心卡片 |
+   | 猪企 002714 | tab 在且点得到、点开后核心卡片有「公司销售均价 / 完全成本 / 商品猪销量」、「估算总利润」那一格带公式 `单位利润 × 120kg/头 × 商品猪出栏量`、**有值时显示 −15.02 亿元而不是缺口语**、单位来自载荷、六个数据库字段名一个都没漏到界面上 |
+   | 主视区表 | 退役指标（**该消失的中文名从真库推出来**：均重 / 种猪销量 / 出栏量 / 屠宰量 / 仔猪销量 / 售价溢价）一个都不剩、表上每一行的名字都能在载荷里找到出处 |
+
+   **它逮住了上面那个白名单缺口**——这正是批 8 记的那条教训（§11.23.7：「卡片长什么样、
+   DOM 里那行字是什么，没有任何测试断言过，`research.js` 在测试里从不执行」），
+   所以这两处前端改动（tab 门控、利润那一格）不靠源码文本断言。探针里那条
+   「退役指标」断言第一版还被自己的**公式文本**误伤过一次（退役名「出栏量」是白名单
+   公式串「商品猪出栏量」的子串）——修法是**先把载荷给过的中文串摘掉**再扫。
+
+#### 11.24.9 库面与测试代价
+
+* **旧表结构改动：零**。不加列、不加表。
+* 测试 **1481 → 1495**（47.5s 全绿），新增 **14** 条全部离线、不联网、不碰真库：
+  `test_pig_core.TestEstimatedProfit` **8**（同期量纲逐位 / 两期不等 / 没有单位利润 /
+  合计口径不许顶 / scope 错行不许用 / 常量没配就不算 / 120kg 取自 `RULES_V1` + 词表在载荷里 /
+  不进评分路径）、`test_pig_evidence.TestRetiredSeries` **2** +
+  `TestFrontendContract` **2**（tab 门控同源、估算总利润那一格不写第二份词表）、
+  `test_cycle_breakdown` **1**（列表 / 详情的 `is_pig_company` 与弹窗逐只同值）、
+  `test_pig_evidence.TestEvidencePayload` **1**（退役指标带了观测也不许回主视区，
+  见 §11.24.3——探针逮住的那个缺口）。
+* 另有 **15 条既有测试的期望值同批更新**（不是新增）：方向表删 `price_premium`、
+  权重表改五格、核心三项的 label / id / 顺序、白名单内的桶、`series_types` 推导 ——
+  全部是「旧期望值」，没有一条是「实现错了」。
+
+#### 11.24.10 刻意偏离与未决
+
+**刻意偏离**：①`commodity_hog_weight_kg` 进 `RULES_V1` 但**不进阈值段**、不新开指纹轴
+（它不是阈值，是一个写下来的假设）；②展示过滤放**后端**（白名单 + `_series_metrics` 交集），
+不在前端——与「口径不许前端兜底」同一精神；③**停抓不删历史**，`national_pig_price` 一个
+factor 位置都没动。
+
+**未决**：
+
+1. **`output_volume` 仍指向生猪合计口径** `M_HOG_SALES_VOLUME`（`pig.py:731`），而核心第三项
+   已换成商品猪口径——两处口径在本批里**没有同步**。它是 display_only（不进分母），
+   所以不是一个错误分数，但「核心卡片上的出栏量」与「这个因子读的出栏量」现在是**两个数**。
+   要同步的话是**改一个因子的口径**，得单独论证（本批只动展示与派生）。
+2. **两套「是不是猪企」判据仍未合并**（§11.24.7）：本批只让 tab 与弹窗**同源**，
+   `cohort` 那条链还在。合并是后续项。
+3. **自动取不到 → 人工补录是常态**（承 §11.23.10 未决①，本批未动）：现成抽取器全是离线 CLI，
+   `engine.analyze` 与新流程不抓猪数据，所以新加的猪企三项全缺，这不是 bug 是
+   「取不到就问你」的如实结果。
+4. **估算总利润经常 missing 是设计**：单位利润只在成本与售价同期时才有值，而
+   `002714` 的成本目前只有 `2026-06` 与 `2025A`。**宁可不给数，不给一个期间错配的数**，
+   页面上会写明原因（§11.24.5）。

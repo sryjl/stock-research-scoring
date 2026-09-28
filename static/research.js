@@ -43,6 +43,21 @@ function auditLabel(s) { return auditLabels()[s.audit_status] || s.audit_status 
 function isGated(s) { return (s?.audit_status || 'UNAUDITED') !== 'OK'; }
 function auditPending() { return state.stocks.some((s) => s.audit_status === 'RUNNING'); }
 const TABS = ['概览', '评分细则', '财务趋势', '资产负债表', '资产审计', '猪行业数据', '现金流', '风险', '历史评分', '价格模拟'];
+/* 「猪行业数据」这个 tab 只对 ``is_pig_company`` 为真的股票开放。判据**不在前端**：
+   它由后端随列表 / 详情一起下发（research/engine.py 的 ``_pig_mark``，与「补充核心
+   经营数据」那个弹窗同一把尺子）。前端若自己按行业名判一次，就会出现「弹窗问你
+   这只新股票的三个数、页面上却没有这个 tab」——两把尺子迟早说两句话。
+   ``TABS`` 本身不动（它是「有哪些页」的清单，不是「这只股票看得到哪些页」），
+   过滤只发生在渲染的那一刻。 */
+const PIG_TAB = '猪行业数据';
+function pigTabVisible() { return !!(state.currentDetail && state.currentDetail.is_pig_company); }
+/* 当前 tab 还看不看得见：URL 直达（``?tab=猪行业数据``）或**上一只股票留着这个 tab、
+   这一只没有这个页**时回落到概览。回落在渲染**之前**做——否则这一页会白发一次
+   ``pig-evidence`` 请求，而且页面上会先闪一下只有那几只股票才有的表。 */
+function normalizeTab() {
+  if (state.currentTab === PIG_TAB && !pigTabVisible()) state.currentTab = '概览';
+  return state.currentTab;
+}
 const COLORS = ['#2563eb', '#13a36f', '#f59e0b', '#8b5cf6'];
 const initialParams = new URLSearchParams(location.search);
 const initialTab = TABS.includes(initialParams.get('tab')) ? initialParams.get('tab') : '概览';
@@ -50,6 +65,7 @@ const state = { stocks: [], meta: null, model: 'all', sort: 'total_score', busy:
   currentDetail: null, currentTab: initialTab, trendMetric: 'revenue', historyMetric: 'total', sim: null,
   assets: null, assetsState: null, assetsCode: null, assetsBusy: false, auditFilter: 'all', auditOpen: new Set(),
   pig: null, pigError: null, pigCode: null, pigBusy: false, pigFilter: 'all', pigOpen: new Set(), pigEvidence: {}, pigEvidenceBusy: new Set(),
+  pigCore: null,
   scoreOpen: new Set(['growth']), historyLegacyOpen: false };
 /* 排序标签：net_cash_ratio 排的是**资产语义层**的调整后净现金/市值
    （旧字段名只是个兼容别名），所以标签必须写明「调整后」，免得又变成
@@ -311,8 +327,15 @@ async function analyze(code, forceFinancials) {
   state.busy = true; $('#btn-analyze').disabled = true;
   try {
     toast(forceFinancials ? '正在重新分析财务数据…' : '正在刷新研究结果…');
-    await api('/api/research/analyze', { method: 'POST', body: JSON.stringify({ code, force_financials: forceFinancials }) });
+    const res = await api('/api/research/analyze', { method: 'POST', body: JSON.stringify({ code, force_financials: forceFinancials }) });
     await loadList(); await openDetail(code, true);
+    // 首次研究一只**组合成员**、而三项里有缺时，后端把补录载荷挂在这一条响应上。
+    // **只有这一条路径会自动弹**：库里已经有这一行之后再点分析，后端不会再给
+    // 这个键（见 server.py 的 _pig_core_prompt），所以「刷新 / 重新评分 /
+    // 重启服务都不再弹」不需要前端记任何状态。「暂不填写」= 什么都不发，
+    // 股票早已由上面这次 analyze 正常落库。批量刷新（refreshAllPrices）走的
+    // 也是这个接口，但它刷的都是库里已有的股票，所以不会弹出一串窗口。
+    if (res && res.pig_core_prompt) openPigCoreDialog(res.pig_core_prompt);
   } catch (e) { toast(e.message, true); }
   finally { state.busy = false; $('#btn-analyze').disabled = false; }
 }
@@ -485,9 +508,11 @@ function renderDetailHead() {
   $('#d-close').addEventListener('click', closeDetail);
 }
 function renderTabs() {
-  drawerTabs.innerHTML = TABS.map((tab) => `<button class="drawer-tab ${tab === state.currentTab ? 'active' : ''}" data-tab="${tab}">${tab}</button>`).join('');
+  normalizeTab();
+  drawerTabs.innerHTML = TABS.filter((tab) => tab !== PIG_TAB || pigTabVisible()).map((tab) => `<button class="drawer-tab ${tab === state.currentTab ? 'active' : ''}" data-tab="${tab}">${tab}</button>`).join('');
 }
 function renderDetailBody() {
+  normalizeTab();
   if (isGated(state.currentDetail)) {
     drawerBody.innerHTML = renderAuditStatePanel(state.currentDetail);
     drawerBody.scrollTop = 0;
@@ -497,17 +522,18 @@ function renderDetailBody() {
   drawerBody.scrollTop = 0;
   if (state.currentTab === '价格模拟') setTimeout(() => { if (!state.sim) runDefaultSimulation(); }, 0);
   if (state.currentTab === '资产审计') setTimeout(() => { if (state.assetsCode !== state.currentCode) loadAssetAudit(); }, 0);
-  if (state.currentTab === '猪行业数据') setTimeout(() => { if (state.pigCode !== state.currentCode) loadPigIndustry(); }, 0);
+  if (state.currentTab === PIG_TAB) setTimeout(() => { if (state.pigCode !== state.currentCode) loadPigIndustry(); }, 0);
 }
 function renderTab() {
   const s = state.currentDetail;
+  normalizeTab();
   switch (state.currentTab) {
     case '概览': return renderOverview(s);
     case '评分细则': return renderScoreDetails(s);
     case '财务趋势': return renderFinancialTrends(s);
     case '资产负债表': return renderBalance(s);
     case '资产审计': return renderAssetAudit(s);
-    case '猪行业数据': return renderPigIndustry(s);
+    case PIG_TAB: return renderPigIndustry(s);
     case '现金流': return renderCashflow(s);
     case '风险': return renderRisk(s);
     case '历史评分': return renderHistory(s);
@@ -1058,22 +1084,39 @@ async function loadAssetAudit(force = false) {
    前端抄了一份风险等级表，抄成了另一句话。 */
 const PIG_FILTERS = [['all', '全部'], ['value', '有值'], ['missing', '缺失']];
 function pigText(v) { return (v === null || v === undefined || v === '') ? '—' : esc(String(v)); }
-function pigNum(v, unit) {
-  if (bad(v)) return absent();
+/* `missing` 是**这一格**缺失时该说的话，由载荷给（后端 `missing_text`）。
+   成本链那几格要说的是「未获取可靠公开数据」——它比「数据缺失」更准：不是
+   我们没抓到，是公司没有披露过。措辞只在后端维护一份；前端不写第二份。
+   **不显示 0 / NaN / —**：缺失就是缺失，一个 0 会被读成「成本是 0」。 */
+function pigNum(v, unit, missing) {
+  if (bad(v)) return absent(missing);
   const n = Number(v);
+  if (!isFinite(n)) return absent(missing);
   return esc(Number.isInteger(n) ? String(n) : n.toFixed(4)) + (unit ? ` <span class="muted">${esc(unit)}</span>` : '');
 }
 function pigFlag(v) { return (v === null || v === undefined) ? '—' : (v ? '是' : '否'); }
 function pigRowKey(metricId, period, variant) { return `${metricId || ''}|${period || ''}|${variant || ''}`; }
+/* 「这一格已经画过了」的判据是 **(指标, 口径) 这一对**，不是指标名。
+   成本链把它逼了出来：`full_cost` 在 cost_grids 里占两格——正身
+   `COMPLETE_COST_PER_KG`（公司自报口径不许升格，如实「未获取可靠公开数据」）
+   与公司自报的 `FULL_COST_COMPANY_DISCLOSED`（真有值）。按指标名去重，第一格
+   会把第二格一起挡掉，于是公司明明披露了 11.7 元/公斤，页面上却写「未获取
+   可靠公开数据」——比缺一行糟得多。
+   同一指标出现多行本来就是这个表的常态（一因子一行：`pig_sale_price` 同时被
+   company_sale_price 与 sale_price_level 消费，`unit_margin` 同理），口径列
+   就是用来分开它们的。**同一对**绝不出现两行，这才是那条「不许自相矛盾」的
+   底线。 */
+function pigPairKey(metricId, variant) { return `${metricId || ''}|${variant || ''}`; }
 /* 读数行与「库里有、但没有任何读数消费」的指标行**共用同一个行构造器**：
    两处的列一样、展开方式一样，分两套渲染只会让一边先烂掉。 */
 function pigRows() {
   const p = state.pig || {};
   const readings = p.readings || {}, metrics = p.metrics || {};
-  const rows = [], seen = new Set();
+  const rows = [], seen = new Set(), seenPairs = new Set();
   Object.keys(readings).forEach((factorId) => {
     const r = readings[factorId];
     if (r.metric_id) seen.add(r.metric_id);
+    if (r.metric_id) seenPairs.add(pigPairKey(r.metric_id, r.metric_variant));
     rows.push({
       kind: 'reading', key: pigRowKey(r.metric_id, r.period, r.metric_variant), openKey: 'r:' + factorId,
       label: r.factor_label || factorId, hint: factorId,
@@ -1090,6 +1133,15 @@ function pigRows() {
     if (seen.has(metricId)) return;
     const bucket = metrics[metricId] || {}, preferred = bucket.preferred || {};
     if (!preferred.period && !(bucket.candidates || []).length && !(bucket.series || []).length) return;
+    /* 这个指标已经有读数行了，**不许再补一行同指标的「读数不消费」**：两行
+       标签一样、值一样，只是多一个标签，纯噪声。（成本链那一段另说——它按
+       **(指标, 口径)** 判重，见 `pigPairKey`：`full_cost` 的公司自报口径在
+       读数里没有对应行，该显示就必须显示。） */
+    seen.add(metricId);
+    /* 也要记这一对：`metrics` 循环铺的这一行本身就是某个口径的值（新希望的
+       育肥成本 12.2 元/公斤就是这么来的——它在库里、却没有因子消费它，于是
+       从这一支长出来）。不记的话成本链那一段会**再铺一行一模一样**的。 */
+    seenPairs.add(pigPairKey(metricId, preferred.metric_variant));
     rows.push({
       kind: 'store', key: pigRowKey(metricId, preferred.period, preferred.metric_variant),
       openKey: 's:' + metricId,
@@ -1102,6 +1154,31 @@ function pigRows() {
       is_direct_disclosure: null, is_estimated: null, expected_variant: null,
       variant_fallback: false, variant_fallback_reason: null,
       reason: preferred.reason, missing_metrics: [],
+    });
+  });
+  /* 批 7：成本链那几行。上面那个 `metrics` 循环只长得出「库里有观测、或有读数
+     消费」的指标，而 `cash_cost`（语料里零披露）两样都不占——不显式补，它在
+     页面上**根本不存在**，而不是显示成「未获取可靠公开数据」，两者在用户那里
+     是「这一格不用看」与「这一格我们确实没有」的区别。
+     标签与缺失措辞一律取载荷，前端不写第二份（见文件顶部那条注释）。 */
+  const gridSeen = new Set();
+  (p.cost_grids || []).forEach((g) => {
+    const pair = pigPairKey(g.metric_id, g.metric_variant);
+    if (!g.metric_id || seenPairs.has(pair) || gridSeen.has(pair)) return;
+    gridSeen.add(pair);
+    const pref = g.preferred || {};
+    rows.push({
+      kind: 'grid', key: pigRowKey(g.metric_id, pref.period, g.metric_variant),
+      openKey: 'g:' + g.metric_id,
+      label: g.metric_label || g.metric_id, hint: g.metric_id,
+      metric_id: g.metric_id, metric_label: g.metric_label,
+      period: pref.period || null, metric_variant: g.metric_variant,
+      value: pref.value, unit: pref.unit || g.unit,
+      status: pref.status, status_label: pref.status_label,
+      source_level_label: pref.source_level_label, source_type: null,
+      is_direct_disclosure: null, is_estimated: null, expected_variant: null,
+      variant_fallback: false, variant_fallback_reason: null,
+      reason: pref.reason, missing_metrics: [], missing_text: g.missing_text,
     });
   });
   return rows;
@@ -1154,7 +1231,7 @@ function renderPigReadingDetail(row) {
   const busy = state.pigEvidenceBusy.has(row.key);
   const head = `<dl>
     <dt>读数</dt><dd>${esc(row.label)}${row.hint && row.hint !== row.label ? ` <span class="muted">（${esc(row.hint)}）</span>` : ''}</dd>
-    <dt>当前值</dt><dd>${pigNum(row.value, row.unit)}</dd>
+    <dt>当前值</dt><dd>${pigNum(row.value, row.unit, row.missing_text)}</dd>
     <dt>口径 / 期间</dt><dd>${pigText(row.metric_variant)} · ${pigText(row.period)}${row.metric_id ? ` · 指标 ${esc(row.metric_id)}` : ''}</dd>
     <dt>状态</dt><dd>${pigText(row.status_label || row.status)}</dd>
     <dt>来源层级 / 类型</dt><dd>${pigText(row.source_level_label)} · ${pigText(row.source_type)}</dd>
@@ -1168,6 +1245,189 @@ function renderPigReadingDetail(row) {
   if (!ev) return head + '<p class="footnote">这一行的证据载荷没有取到。</p>';
   return head + renderPigEvidence(row, ev);
 }
+/* ---------- 核心经营数据（批 8）----------
+   组合成员的核心只有三项：**销售均价 / 完全成本 / 出栏量**。核心关系是
+   `单位利润 = 销售均价 − 完全成本` 与 `盈利能力 ≈ 单位利润 × 出栏规模`，
+   所以 PSY / MSY / 料肉比 / 出栏均重 / 断奶仔猪成本 / 现金成本 等一律是
+   **扩展信息**：它们照旧在下面那张「读数与观测」表里，只是不进这张卡片、
+   不触发补录、不再是首次研究的完整性要求。
+
+   卡片**只读**后端载荷：指标名、单位、缺失措辞、期间写法、来源层级、组合名
+   全部取 payload（见本文件顶部那条约定，`test_cycle_breakdown` 逐字钉着组合名
+   那一份），前端算的唯一一件事是排版。 */
+/* 后端给的理由（``pig_cost_core.derive`` 的 ``skipped``）里带 Markdown 的 ``**``
+   强调，卡片的小字是纯文本，直接摊上去会露出两个星号；硬切 60 字还会把一个
+   单词拦腰截断（实测「…是 weaned_piglet_cost / co」）。**只是显示层的收尾**：
+   不重算、不改口径、不改后端那句话本身。 */
+function pigReason(text, limit = 60) {
+  const plain = String(text || '').replace(/\*\*/g, '');
+  return limit && plain.length > limit ? plain.slice(0, limit) + '…' : plain;
+}
+
+function renderPigCoreCard(p, cohortLabel) {
+  const core = p.pig_core;
+  if (!core) return '';
+  const cards = (core.metrics || []).map((m) => (m.obtained
+    ? metricCard(esc(m.label), pigNum(m.value, m.unit, m.missing_text),
+      `期间 ${pigText(m.period)} · ${pigText(m.source_level_label || m.source_type)}`)
+    : metricCard(esc(m.label), absent(m.missing_text),
+      `单位 ${pigText(m.unit)}`)));
+  const um = core.unit_margin || {};
+  // 单位利润**只在两侧期间足够匹配时**才是一个数（判据在批 7 的
+  // ``pig_cost_core.derive``，前端不重算）。算不出来时显示 missing + 后端
+  // 给的理由原文——那句话说的正是「为什么不匹配」，比一个 dash 有用得多。
+  cards.push(metricCard(
+    `${esc(um.label || '')} <span class="muted">（${esc(um.formula || '')}）</span>`,
+    bad(um.value) ? absent(um.missing_text) : pigNum(um.value, um.unit, um.missing_text),
+    um.value === null || um.value === undefined
+      ? esc(pigReason(um.reason))
+      : `期间 ${pigText(um.period)}`,
+    // 悬停里的那句话**不截断**（40 字看不完的理由，悬停正是用来看完的），
+    // 只去掉星号。
+    pigReason(um.reason, 0)));
+  // 每头利润 / 估算总利润：**一格**。两个数是同一条链子上的中间值与结果
+  // （单位利润 → 每头利润 → 总利润），拆成两格只会让 missing 时的同一句理由
+  // 在卡片上出现两遍。**词表全部来自载荷**：标签、公式、单位、缺口语、以及
+  // 那个换算系数（``weight_kg`` 只用来核对，界面上的公式是后端写的字）。
+  // 前端不写第二份，尤其**不写 120 这个数**——它改一次（``RULES_V1``）这里
+  // 就该跟着变，写死一个 120 之后两者会悄悄不一致。
+  const ep = core.estimated_profit || {};
+  const epMissing = bad(ep.value);
+  cards.push(metricCard(
+    `${esc(ep.label || '')} <span class="muted">（${esc(ep.formula || '')}）</span>`,
+    epMissing ? absent(ep.missing_text) : pigNum(ep.value, ep.unit, ep.missing_text),
+    epMissing
+      ? esc(pigReason(ep.reason))
+      : `${esc(ep.per_head_label || '')} ${pigNum(ep.per_head, ep.per_head_unit, ep.missing_text)}`
+        + ` · ${esc(ep.volume_label || '')} ${pigNum(ep.volume, ep.volume_unit, ep.missing_text)}`
+        + ` · 期间 ${pigText(ep.period)}`,
+    pigReason(ep.reason, 0)));
+  const missing = (core.missing || []).map((m) => m.label).join('、');
+  const hint = core.is_pig_company
+    ? (missing ? `缺：${esc(missing)}。缺的可以直接补，也可以先跳过——不影响这只股票加入研究库。`
+      : '三项都已获取，无需补充。')
+    : `${cohortLabel ? esc(cohortLabel) + '组合' : '这个组合'}的行业映射里没有这一只，所以没有补录入口。`;
+  const button = core.is_pig_company
+    ? `<button class="btn btn-sm" data-pig-core-open>＋ 补充核心经营数据</button>` : '';
+  return `<h4 class="subsection-title">核心经营数据 ${button}</h4>
+    <div class="metric-grid group-2">${cards.join('')}</div>
+    <p class="footnote">${hint}</p>`;
+}
+
+/* 补充核心经营数据：Dialog 的行**由载荷驱动**——已自动获取的项只读展示（§四
+   只让用户补 missing），缺的那几项才给输入框。用户只填 value / period
+   （+ 选填备注），单位按指标预设。scope / 置信度 / 来源层级 / 哈希**不进界面**：
+   把一个数据库行摊给用户看，他要判断的事情就从「这个数是多少」变成了
+   「这个字段该填什么」。 */
+function pigCoreOverlay() { return document.getElementById('pig-core-overlay'); }
+function openPigCoreDialog(payload) {
+  if (!payload) return;
+  state.pigCore = payload;
+  const overlay = pigCoreOverlay();
+  if (!overlay) return;
+  overlay.hidden = false;
+  renderPigCoreDialog();
+}
+function closePigCoreDialog() {
+  const overlay = pigCoreOverlay();
+  if (overlay) overlay.hidden = true;
+  state.pigCore = null;
+}
+function renderPigCoreDialog() {
+  const modal = document.getElementById('pig-core-modal'), core = state.pigCore;
+  if (!modal || !core) return;
+  const forms = (core.period_forms || []).join(' / ');
+  const fields = (core.metrics || []).map((m) => (m.obtained
+    ? `<div class="field full"><label>${esc(m.label)}（${esc(m.unit)}）· 已自动获取</label>
+         <div class="muted">${pigNum(m.value, m.unit, m.missing_text)} · 期间 ${pigText(m.period)} · ${pigText(m.status_label)} · ${pigText(m.source_level_label)}</div></div>`
+    : `<div class="field"><label>${esc(m.label)}（${esc(m.unit)}）</label>
+         <input type="number" step="any" data-pig-value="${esc(m.metric_id)}" placeholder="数值"></div>
+       <div class="field"><label>期间<span class="muted">（${esc(forms)}）</span></label>
+         <input type="text" data-pig-period="${esc(m.metric_id)}" placeholder="${esc((core.period_forms || [])[0] || '')}"></div>`)).join('');
+  const entries = (core.manual_entries || []).map((e) => `<li>${esc(e.metric_label)} · ${pigNum(e.value, e.unit, '')} · 期间 ${pigText(e.period)}
+      <button class="btn btn-sm" data-pig-core-delete="${esc(e.observation_hash)}">删除</button>
+      ${e.conflict_note ? `<div class="footnote warn">${esc(e.conflict_note)}</div>` : ''}</li>`).join('');
+  // 组合名**只从载荷来**：它是 ``industry_margin.COHORTS`` 里的
+  // 一份中文名，前端留第二份就会在改口径时两边说不一样的话（这条有测试钉着）。
+  const cohort = state.currentDetail?.cohort_label;
+  const names = (core.metrics || []).map((m) => esc(m.label)).join(' / ');
+  const umLabel = esc(core.unit_margin?.label || '');
+  const umFormula = esc(core.unit_margin?.formula || '');
+  modal.innerHTML = `
+    <div class="modal-head"><div><h2>补充核心经营数据</h2>
+      <div class="code">${cohort ? esc(cohort) + ' · ' : ''}${esc(core.code)} · ${names} · 规则 ${esc(core.rule_version || '')}</div></div>
+      <button class="modal-close" data-pig-core-close aria-label="关闭">×</button></div>
+    <p class="footnote">核心关系：${umLabel} = ${umFormula}。
+      这里只补缺的项，来源不是必填，填不出准确的数字就【暂不填写】——不影响这只股票进研究库。
+      人工补录的数据只是研究数据，不作为公司披露值，也不进评分。</p>
+    <div class="form">${fields}
+      <div class="field full"><label>来源 / 备注（选填）</label>
+        <textarea data-pig-note placeholder="例：2026 半年报业绩说明会 / 月度销售简报"></textarea></div>
+      <div class="form-actions">
+        <button class="btn" data-pig-core-close>暂不填写</button>
+        <button class="btn btn-primary" id="pig-core-save">保存</button></div></div>
+    <div id="pig-core-errors"></div>
+    ${entries ? `<h4 class="subsection-title">已人工补录</h4><ul class="footnote">${entries}</ul>` : ''}`;
+}
+function pigCoreItems() {
+  const items = [];
+  (state.pigCore?.metrics || []).forEach((m) => {
+    if (m.obtained) return;
+    const value = document.querySelector(`[data-pig-value="${m.metric_id}"]`)?.value;
+    const period = document.querySelector(`[data-pig-period="${m.metric_id}"]`)?.value;
+    if ((value || '').trim() === '' && (period || '').trim() === '') return;
+    items.push({ metric_id: m.metric_id, value: value, period: period,
+      source_note: document.querySelector('[data-pig-note]')?.value || '' });
+  });
+  return items;
+}
+async function submitPigCore() {
+  const core = state.pigCore;
+  if (!core) return;
+  const items = pigCoreItems();
+  if (!items.length) { toast('没有要保存的项'); return; }
+  const btn = document.getElementById('pig-core-save');
+  if (btn) btn.disabled = true;
+  try {
+    const out = await api('/api/research/pig-core', { method: 'POST',
+      body: JSON.stringify({ code: core.code, items }) });
+    if (!out.ok) {
+      // 逐字段的错误**原样放到填写的人眼前**（服务端已经写成中文），
+      // 一条不合法就整批不写——写一半会留下一个「看起来完整」的状态。
+      const box = document.getElementById('pig-core-errors');
+      if (box) box.innerHTML = `<p class="footnote warn">${(out.errors || []).map((x) => esc(x.message)).join('<br>')}</p>`;
+      toast('没有保存：填的内容有问题', true);
+      return;
+    }
+    const replaced = (out.replaced || []).length;
+    state.pigCore = out.pig_core;
+    renderPigCoreDialog();
+    toast(replaced ? `已保存（替换了 ${replaced} 条之前填的）` : '已保存');
+    // 猪行业数据页就在后面：就地刷新那张卡片与那张表，不重新发一次请求。
+    if (state.currentTab === '猪行业数据' && state.pig) {
+      state.pig.pig_core = out.pig_core;
+      drawerBody.innerHTML = renderTab();
+    }
+  } catch (e) { toast(e.message, true); }
+  finally { if (btn) btn.disabled = false; }
+}
+async function deletePigCoreEntry(handle) {
+  const core = state.pigCore;
+  if (!core || !handle) return;
+  try {
+    const out = await api('/api/research/pig-core/delete', { method: 'POST',
+      body: JSON.stringify({ code: core.code, observation_hashes: [handle] }) });
+    if (!out.ok) { toast((out.errors || [{}])[0].message || '没能删除', true); return; }
+    state.pigCore = out.pig_core;
+    renderPigCoreDialog();
+    toast('已删除这一条人工补录');
+    if (state.currentTab === '猪行业数据' && state.pig) {
+      state.pig.pig_core = out.pig_core;
+      drawerBody.innerHTML = renderTab();
+    }
+  } catch (e) { toast(e.message, true); }
+}
+
 function renderPigIndustry(s) {
   if (state.pigBusy) return section('猪行业数据', '', '<div class="chart-empty">正在读取观测仓…</div>');
   if (state.pigError) return section('猪行业数据', '', `<div class="chart-empty">读取证据失败：${esc(state.pigError)}</div>`);
@@ -1186,7 +1446,7 @@ function renderPigIndustry(s) {
     ].filter(Boolean).join(' ');
     const main = `<tr data-pig-toggle="${esc(r.openKey)}" class="audit-row${open ? ' open' : ''}">
       <td>${esc(r.label)}${tags ? ' ' + tags : ''}</td>
-      <td class="num">${pigNum(r.value, r.unit)}</td>
+      <td class="num">${pigNum(r.value, r.unit, r.missing_text)}</td>
       <td class="small">${pigText(r.metric_variant)}</td>
       <td>${pigText(r.period)}</td>
       <td>${pigText(r.status_label || r.status)}</td>
@@ -1211,7 +1471,7 @@ function renderPigIndustry(s) {
     </tr></thead><tbody>${body}</tbody></table></div>`;
   const foot = `<p class="footnote">规则 ${esc(p.rule_version || '—')} · 载荷生成于 ${esc(p.generated_at || '—')} · 观测 ${counts.observations || 0} 条（${(counts.store || {}).groups || 0} 组）· 指标 ${counts.metrics || 0} 个 · 候选 ${counts.candidates || 0} 条 · 冲突组 ${counts.conflicts_group_pairs || 0} 对 · 简报缓存 ${(counts.store || {}).bulletins || 0} 条 · 行业序列 ${(counts.store || {}).series || 0} 点</p>`;
   return section('猪行业数据', '读数与它背后的每一条观测：值、口径、期间、状态、来源层级与原文段落。点开任一行看这一组的全部候选（不含在评分里）',
-    notes + table + foot, 'audit-card');
+    renderPigCoreCard(p, s.cohort_label) + notes + table + foot, 'audit-card');
 }
 async function loadPigIndustry() {
   const code = state.currentCode;
@@ -1393,6 +1653,15 @@ async function runOneSimulation() {
 
 /* ---------- 交互 ---------- */
 document.addEventListener('click', (e) => {
+  if (e.target.closest('[data-pig-core-open]')) {
+    // 已有组合成员的轻量补充入口（§十）。载荷就在猪行业数据那一份里，不再发请求。
+    openPigCoreDialog(state.pig?.pig_core);
+    return;
+  }
+  if (e.target.closest('[data-pig-core-close]')) { closePigCoreDialog(); return; }
+  const pigDelete = e.target.closest('[data-pig-core-delete]');
+  if (pigDelete) { deletePigCoreEntry(pigDelete.dataset.pigCoreDelete); return; }
+  if (e.target.closest('#pig-core-save')) { submitPigCore(); return; }
   const sortOption = e.target.closest('[data-sort-option]');
   if (sortOption) {
     state.sort = sortOption.dataset.sortOption;

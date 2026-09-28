@@ -473,12 +473,12 @@ CATALOG = (
         "cost_advantage", "成本优势",
         "公司完全成本相对同组公司中位数的偏离（越低越优）",
         POINT, SRC_PIG_INDUSTRY, "percent"),
-    MetricSpec(
-        "price_premium", "售价溢价",
-        "公司销售均价相对同组公司中位数的偏离",
-        POINT, SRC_PIG_INDUSTRY, "percent",
-        note="溢价常来自销售模式与区域结构而不是品牌力，所以它单独一格，"
-             "**不并进成本优势**。"),
+    # 批 9 删 ``price_premium``（售价溢价 = 区域溢价）的登记：那一格因子已摘
+    # （见 ``research.factors`` 同处的说明），目录留着一个不再存在的分量，
+    # 只会让「目录和实现对不上」的检查失效。
+    # **删的只是这个评分分量的名字**：``M_REGIONAL_PREMIUM`` 那条**指标**
+    # （``regional_price_premium``）照旧在 ``industry.pig`` 的 METRIC_DEFS 里，
+    # 它的观测、派生与 GAP_REASONS 一条没删——本模块从来不登记那些指标名。
     MetricSpec(
         "output_volume", "出栏量",
         "公司当期生猪出栏量（万头）",

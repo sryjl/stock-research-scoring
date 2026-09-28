@@ -21,6 +21,7 @@
 import io
 import json
 import pathlib
+import re
 import sqlite3
 import sys
 import tempfile
@@ -418,7 +419,7 @@ class TestVariantFallbackLocks(unittest.TestCase):
         """缺值时 ``value is None``、``status`` 与 ``reason`` 都在，**绝不用 0 顶**。"""
         state = PIG.state(CODE, reports=[], store=_store([]))
         for factor_id in ("full_cost", "unit_margin", "sow_supply_pressure",
-                          "financial_survivability", "price_position"):
+                          "financial_survivability", "sale_price_level"):
             reading = state["readings"][factor_id]
             self.assertIsNone(reading["value"], factor_id)
             self.assertTrue(reading["status"], factor_id)
@@ -656,6 +657,54 @@ class TestEvidencePayload(unittest.TestCase):
         self.assertEqual(payload["counts"]["candidates"], 2)
         self.assertEqual(payload["filters"]["candidates"], True)
 
+    def test_the_core_card_never_invents_a_value(self):
+        """批 8：载荷带 ``is_pig_company`` / ``pig_core``，且**核心卡片上的每一个
+        数都能在 ``metrics[...]["preferreds"]`` 里找到同一条观测**（同一个
+        ``observation_hash``）——卡片是读数的另一种排版，不是第二个算数的地方。
+
+        「补充核心经营数据」那个入口也由 ``is_pig_company`` 决定：载荷说是猪企，
+        界面上才有那颗按钮（前端不自己判断代码表）。
+        """
+        from research import pig_core as core_mod
+        obs.append(self.conn, [_company_price("2026-08", 12.16)])
+        payload = self._build()
+        self.assertIn("is_pig_company", payload)
+        self.assertIn("pig_core", payload)
+        self.assertEqual(payload["is_pig_company"], payload["pig_core"]["is_pig_company"])
+        core = payload["pig_core"]
+        # 三项核心的第三项批 9 换成**商品猪口径**：``单位利润 × 120kg`` 里的
+        # 「每头」是商品猪，合计口径含仔猪与种猪，并排摆着最容易被当成同一个数
+        # 相乘。期望值直接取自 ``CORE_METRICS`` 那份声明，不抄第二份字面量。
+        self.assertEqual([m["metric_id"] for m in core["metrics"]],
+                         [m.metric_id for m in core_mod.CORE_METRICS])
+        self.assertIn("unit_margin", core)
+        self.assertTrue(core["unit_margin"]["label"])
+        self.assertEqual(core["unit_margin"]["missing_text"], ev.MISSING_TEXT)
+        known = set()
+        for bucket in payload["metrics"].values():
+            for summary in bucket.get("preferreds") or []:
+                if summary.get("observation_hash"):
+                    known.add(summary["observation_hash"])
+        for item in core["metrics"]:
+            if not item.get("obtained"):
+                continue
+            # 卡片说「有值」→ 那个值必须在证据里指得出是哪一条观测给出来的。
+            self.assertIn(item["source_level"], ev.obs.LABEL_BY_LEVEL)
+            match = [s for bucket in payload["metrics"].values()
+                     for s in (bucket.get("preferreds") or [])
+                     if s.get("metric_variant") == item["metric_variant"]
+                     and s.get("period") == item["period"]]
+            self.assertTrue(match, "卡片上的值在证据里找不到同一条观测")
+            self.assertIn(match[0]["observation_hash"], known)
+
+    def test_the_missing_wording_has_exactly_one_definition(self):
+        """缺失措辞只有一份：``pig_evidence.MISSING_TEXT`` 是 ``pig_core`` 的别名。"""
+        from research import pig_core as core_mod
+        self.assertIs(ev.MISSING_TEXT, core_mod.MISSING_TEXT)
+        payload = self._build()
+        for item in payload["pig_core"]["metrics"]:
+            self.assertEqual(item["missing_text"], ev.MISSING_TEXT)
+
     def test_evidence_can_be_fetched_without_the_candidate_details(self):
         """``candidates=False`` 只少明细，**不改载荷形状**：键永远在。
 
@@ -730,12 +779,110 @@ class TestEvidencePayload(unittest.TestCase):
         self.assertTrue(month["enough_for_benchmark"])
 
     def test_an_empty_grid_still_gets_a_bucket(self):
-        """读侧接的指标即使一条观测都没有，也必须有桶——「这格什么都没有」与
-        「这格没被列出来」在界面上是两件事。"""
+        """主视区里的指标即使一条观测都没有，也必须有桶——「这格什么都没有」与
+        「这格没被列出来」在界面上是两件事。
+
+        批 9 之后这条不变量**只在主视区白名单内成立**：``M_EFFECTIVE_CAPACITY``
+        不在白名单里（用户清单只要销售均价 / 完全成本 / 商品猪出栏量 / 生猪价格
+        / 单位利润），所以它在主视区**没有桶**是设计，不是漏播种。而它作证据
+        该有的那条路一条没少——**点名 metric_id 时仍然有桶**（见下一条断言）。
+        """
         payload = self._build()
-        for metric_id in (PIG.M_FULL_COST, PIG.M_EFFECTIVE_CAPACITY):
-            self.assertIn(metric_id, payload["metrics"])
-            self.assertIsNone(payload["metrics"][metric_id]["preferred"])
+        for metric_id in (PIG.M_FULL_COST, PIG.M_PIG_SALE_PRICE,
+                          PIG.M_COMMODITY_HOG_SALES_VOLUME,
+                          PIG.M_NATIONAL_PIG_PRICE, PIG.M_UNIT_MARGIN):
+            self.assertIn(metric_id, payload["metrics"], metric_id)
+            self.assertIsNone(payload["metrics"][metric_id]["preferred"], metric_id)
+        # 退役展示不是删除：点开某一格仍能查它的全部候选与观测。
+        named = ev.build(self.conn, CODE, cfg=_cfg(), candidates=False,
+                         metric_id=PIG.M_EFFECTIVE_CAPACITY)
+        self.assertIn(PIG.M_EFFECTIVE_CAPACITY, named["metrics"])
+        self.assertNotIn(PIG.M_EFFECTIVE_CAPACITY, payload["metrics"])
+
+    def test_a_retired_metric_with_observations_stays_out_of_the_main_view(self):
+        """**桶是从观测长出来的**，所以「不播种」不等于「不显示」——这条就是那个缺口。
+
+        上面那条 ``assertNotIn`` 一直是绿的，因为它**没有给退役指标造观测**，桶
+        根本长不出来。而 ``metrics`` 主要是 ``obs.group(rows)`` 长出来的（第 301 行），
+        播种那一步只影响「一个观测都没有的格子」。真库里退役指标**有观测**：批 9 的
+        无头浏览器探针实测 002714，主视区除白名单那几行外还多铺了 **7 行**「读数不消费」
+        （均重 / 种猪销量 / 屠宰量 / 仔猪销量 / 售价溢价 / 合计口径出栏量）——
+        正是用户那句「现在计算的东西太多了」。修法是发货前 `_visible(metrics, visible)`。
+
+        三条断言缺一不可：主视区没有它、点名取它必须有、**值还对**（否则「过滤」
+        可以退化成「反正查不到」）。
+        """
+        retired = [mid for mid in (PIG.M_HOG_SLAUGHTER_VOLUME,
+                                   PIG.M_BREEDING_PIG_SALES_VOLUME,
+                                   PIG.M_AVERAGE_SALE_WEIGHT)
+                   if mid not in PIG.DISPLAY_METRIC_IDS]
+        self.assertTrue(retired, "三个候选全进了白名单？这条测试已经失去意义")
+        metric_id = retired[0]
+        obs.append(self.conn, [_observation(metric_id, "monthly_heads",
+                                            period="2026-08", value=88.0,
+                                            unit="万头", scope=PIG.SCOPE_ALL)])
+        payload = self._build()
+        self.assertNotIn(metric_id, payload["metrics"],
+                         "退役指标带了观测就回到主视区了——白名单只挡了「播种」")
+        self.assertNotIn(metric_id, {r.get("metric_id")
+                                     for r in payload["readings"].values()})
+        named = ev.build(self.conn, CODE, cfg=_cfg(), candidates=False,
+                         metric_id=metric_id)
+        self.assertEqual(named["metrics"][metric_id]["preferred"]["value"], 88.0)
+
+
+# --------------------------------------------------------------------------- #
+# 批 9：停抓的两个序列（仔猪价 / 白条价）
+# --------------------------------------------------------------------------- #
+class TestRetiredSeries(unittest.TestCase):
+    """**停抓不是删除**：已抓的历史一行不动，只是不再新增、不再进主视区。
+
+    这一件事要改三处，少一处就藏不住——抓侧 ``series_types``、读侧
+    ``series_targets``、以及装配时的 ``_series_metrics``（它取两者的交集）。
+    只改读侧的话，下一次抓取又把它们补回来；只改抓侧的话，**库里早已抓到的
+    两千多行**照样被捞出来铺到页面上，「已经不抓了」就成了一句空话。用户长期
+    指令第 10 条要求原始数据保留，所以这里同时钉「库里还在」与「载荷里没有」。
+    """
+
+    def setUp(self):
+        self.conn = _conn()
+        self.addCleanup(self.conn.close)
+        patcher = mock.patch("research.pig_reports.inspect_cached_pig_report",
+                             return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.retired = (PIG.M_PIGLET_PRICE, PIG.M_WHITE_MEAT_PRICE)
+
+    def test_the_collection_and_the_reading_layer_name_the_same_one_series(self):
+        """停抓名单只有一处真相：抓侧与读侧必须**同时**只剩生猪价格。"""
+        self.assertEqual(set(PIS.Yangzhu360Provider.series_types),
+                         {PIG.M_NATIONAL_PIG_PRICE})
+        self.assertEqual({mid for mid, _v, _r in readings.series_targets(_cfg())},
+                         {PIG.M_NATIONAL_PIG_PRICE})
+
+    def test_the_retired_series_stay_in_the_store_and_out_of_the_payload(self):
+        for metric_id in self.retired:
+            variant = PIG.METRIC_INDEX[metric_id].variant_names[0]
+            PIS._write_points(self.conn, _month_points("2026-08", 31, 22.5,
+                                                       metric_id=metric_id,
+                                                       variant=variant))
+        PIS._write_points(self.conn, _month_points("2026-08", 31, 11.83))
+        # 行业序列不是观测：这两个序列在观测仓里**一行观测都没有**，所以
+        # 「不再显示」对它们的含义就是不再进载荷（下钻那条路走的是观测，
+        # 这里本来就没有可下钻的行）。判据是「库里有没有」与「载荷里有没有」
+        # 两件事**同时**成立——只钉后者的话，把历史删了这条测试照样绿。
+        in_store = {row[0] for row in self.conn.execute(
+            "SELECT DISTINCT metric_id FROM pig_industry_series")}
+        payload = ev.build(self.conn, CODE, cfg=_cfg(), candidates=False)
+        for metric_id in self.retired:
+            with self.subTest(metric_id=metric_id):
+                self.assertIn(metric_id, in_store, "历史被删了——停抓不是删除")
+                self.assertEqual(len(PIS.load(self.conn, metric_id)), 31)
+                self.assertNotIn(metric_id, payload["metrics"],
+                                 "停抓的序列不许进载荷")
+        # 只剩生猪价格那一格带序列（停的是两个，不是一个都不抓）。
+        self.assertEqual({name for name, bucket in payload["metrics"].items()
+                          if bucket["series"]}, {PIG.M_NATIONAL_PIG_PRICE})
 
 
 # --------------------------------------------------------------------------- #
@@ -857,6 +1004,110 @@ class TestScoringIsolation(unittest.TestCase):
             self.assertEqual(result.status, status, exposure)
 
 
+class TestCostGrids(unittest.TestCase):
+    """批 7：成本链那几行**必须永远在**，哪怕一条观测都没有。
+
+    ``cash_cost`` 与 ``fattening_cost`` 既没有因子消费它们、语料里也没有它们
+    的观测（实测零披露），所以桶与行都得**显式播种**——从载荷的现有结构里
+    长不出来。这里钉的是「播种出来的东西不许自己造值」。
+    """
+
+    def setUp(self):
+        self.conn = _conn()
+        self.addCleanup(self.conn.close)
+        patcher = mock.patch("research.pig_reports.inspect_cached_pig_report",
+                             return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _build(self):
+        return ev.build(self.conn, CODE, cfg=_cfg(), candidates=False)
+
+    def _grid(self, payload, metric_id, variant):
+        found = [g for g in payload["cost_grids"]
+                 if (g["metric_id"], g["metric_variant"]) == (metric_id, variant)]
+        self.assertEqual(len(found), 1, (metric_id, variant))
+        return found[0]
+
+    def test_the_cost_buckets_exist_even_when_nothing_was_disclosed(self):
+        """20b：主视区里留下的成本格即使零披露，桶也必须在，且如实为空。
+
+        批 9 之前这条钉的是**五条**成本格全在；改成白名单之后只剩 ``full_cost``
+        那两条（正身 + 公司自报）。这不是「播种少了」，是**主视区变小了**：
+        ``cash_cost`` 语料里零披露、``weaned_piglet_cost`` 是元/头的仔猪口径
+        （用户裁定仔猪不计入）、``fattening_cost`` 是「只含正常运营场线」的子集
+        口径——三条都不在用户点名要看的五格之内。
+
+        **退役展示不是删除**：它们的桶点名就取得到（见下面那条断言），
+        ``pig_metric_observation`` 一行没删。
+        """
+        payload = self._build()
+        for metric_id in (PIG.M_FULL_COST,):
+            self.assertIn(metric_id, payload["metrics"], metric_id)
+            self.assertIsNone(payload["metrics"][metric_id]["preferred"], metric_id)
+            self.assertEqual(payload["metrics"][metric_id]["candidates"], [])
+        for metric_id in (PIG.M_CASH_COST, PIG.M_FATTENING_COST,
+                          PIG.M_WEANED_PIGLET_COST):
+            self.assertNotIn(metric_id, payload["metrics"], metric_id)
+            named = ev.build(self.conn, CODE, cfg=_cfg(), candidates=False,
+                             metric_id=metric_id)
+            self.assertIn(metric_id, named["metrics"],
+                          "下钻必须还取得回来——退役的是展示，不是数据")
+
+    def test_every_cost_grid_line_reads_its_label_and_wording_from_the_payload(self):
+        """20c：主视区剩下的成本格逐条在，标签来自 ``MetricDef.display_name``，
+        缺失措辞来自后端常量——前端不写第二份。
+
+        期望值由**白名单与 ``COST_GRIDS`` 的交集**算出，而不是抄一份字面量：
+        抄一份就等于把「哪些格该显示」在测试里形成第二份真相，界面改了测试
+        还绿着。这里真正要钉的是「载荷里那几条的标签与措辞都来自后端」。
+        """
+        payload = self._build()
+        want = [(metric_id, variant) for metric_id, variant in ev.COST_GRIDS
+                if metric_id in PIG.DISPLAY_METRIC_IDS]
+        self.assertEqual(
+            [(g["metric_id"], g["metric_variant"]) for g in payload["cost_grids"]],
+            want)
+        self.assertTrue(want, "白名单与成本格的交集不该是空的")
+        for grid in payload["cost_grids"]:
+            definition = PIG.METRIC_INDEX[grid["metric_id"]]
+            self.assertEqual(grid["metric_label"], definition.display_name)
+            self.assertEqual(grid["metric_label"],
+                             payload["metrics"][grid["metric_id"]]["metric_label"])
+            self.assertEqual(grid["missing_text"], ev.MISSING_TEXT)
+            self.assertEqual(grid["unit"], definition.unit_of(grid["metric_variant"]))
+            self.assertIsNone(grid["preferred"], "没有观测就是 None，不许合成")
+
+    def test_a_cost_grid_shows_the_observation_or_nothing_at_all(self):
+        """20d：落一条观测 → **只有它那一格**有值，同一指标的另一格仍是 None。
+
+        ``full_cost`` 在册两个 variant（正身 ``COMPLETE_COST_PER_KG`` 与公司自报
+        口径）。拿自报口径的数去顶正身那一格，会让「公司说的完全成本」被读成
+        「统一口径的完全成本」——**那正是这一批拒绝做的事**。
+        """
+        landed = _observation(PIG.M_FULL_COST, "FULL_COST_COMPANY_DISCLOSED",
+                              period="2026-06", value=11.7, unit="CNY/kg",
+                              scope=PIG.SCOPE_COMMODITY)
+        obs.append(self.conn, [landed])
+        payload = self._build()
+        disclosed = self._grid(payload, PIG.M_FULL_COST,
+                               "FULL_COST_COMPANY_DISCLOSED")
+        self.assertIsNotNone(disclosed["preferred"])
+        self.assertEqual(disclosed["preferred"]["observation_hash"],
+                         landed.observation_hash)
+        canonical = self._grid(payload, PIG.M_FULL_COST, "COMPLETE_COST_PER_KG")
+        self.assertIsNone(canonical["preferred"],
+                          "公司自报口径不许升格成统一口径")
+        for grid in payload["cost_grids"]:
+            if grid["preferred"] is None:
+                continue
+            hashes = {summary["observation_hash"]
+                      for summary in payload["metrics"][grid["metric_id"]]
+                      ["preferreds"]}
+            self.assertIn(grid["preferred"]["observation_hash"], hashes,
+                          "格子里出现的值必须点得到它自己那一组")
+
+
 class TestFrontendContract(unittest.TestCase):
 
     def test_the_tab_exists_and_the_page_reads_labels_from_the_payload(self):
@@ -877,6 +1128,105 @@ class TestFrontendContract(unittest.TestCase):
         self.assertNotIn("OK: '正常'", source,
                          "前端自己造了一份状态表——状态名只许从载荷取")
         self.assertNotIn("L6: '", source, "来源层级的中文名同样只许从载荷取")
+
+    def test_the_cost_rows_take_their_wording_from_the_payload(self):
+        """成本链那几行：缺失措辞由载荷给，前端不写第二份，**不显示 0 / —**。
+
+        「未获取可靠公开数据」与「数据缺失」是两个意思：前者是公司没有披露过，
+        后者是我们没抓到。措辞只在后端维护一份。
+        """
+        with io.open(JS_PATH, encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertIn("p.cost_grids", source)
+        self.assertIn("g.missing_text", source)
+        # 措辞可以在**注释**里被引用（那些注释正是解释「为什么要这么说」的地方），
+        # 但不许出现在任何可执行文本里——把注释剥掉再查一次。
+        code = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+        code = re.sub(r"^\s*//.*$", "", code, flags=re.M)
+        self.assertNotIn("未获取可靠公开数据", code,
+                         "缺失措辞只许从载荷的 missing_text 取")
+        # 渲染数的那一处必须把这一格的措辞传下去；`pigNum` 缺第三个参数时回落到
+        # 全局的「数据缺失」，那正是成本链要避免的说法。
+        for template in ("${pigNum(row.value, row.unit, row.missing_text)}",
+                         "${pigNum(r.value, r.unit, r.missing_text)}"):
+            self.assertIn(template, source)
+        self.assertNotIn("pigNum(row.value, row.unit)}", source)
+
+    def test_the_cost_rows_are_deduped_by_metric_and_variant_not_by_name(self):
+        """重行的判据是 **(指标, 口径)** 这一对——按指标名去重会把真值挡掉。
+
+        `full_cost` 在 ``cost_grids`` 里占两格：正身 ``COMPLETE_COST_PER_KG``
+        （公司自报口径不许升格 → 如实「未获取可靠公开数据」）与公司自报的
+        ``FULL_COST_COMPANY_DISCLOSED``（牧原真有 11.7 元/公斤）。前端要是按
+        指标名去重，牧原那一页就会写着「完全成本 未获取可靠公开数据」，而库里
+        躺着它自己披露的 11.7——恰好是这一批要消灭的那种页面。
+        """
+        with io.open(JS_PATH, encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertIn("function pigPairKey(metricId, variant)", source)
+        self.assertIn("seenPairs.add(pigPairKey(r.metric_id, r.metric_variant))",
+                      source, "读数行认领的必须是「这一对」")
+        self.assertIn("const pair = pigPairKey(g.metric_id, g.metric_variant)", source)
+        self.assertIn("seenPairs.has(pair)", source)
+        # `metrics` 那一支铺的行同样占掉一对：新希望的育肥成本 12.2 元/公斤
+        # 就是从那里长出来的（库里有观测、没有因子消费它）。它不记的话，
+        # 成本链会再铺一行一模一样的——node 探针实测抓到过这个重复。
+        self.assertIn("seenPairs.add(pigPairKey(metricId, preferred.metric_variant))",
+                      source)
+        self.assertNotIn("seen.has(g.metric_id)", source,
+                         "按指标名去重会连有值的那一格一起挡掉")
+        # 载荷那一侧由 ``TestCostGrids`` 的 20d 钉住：落一条公司自报口径的观测
+        # 之后，只有它那一格有值，正身那格仍是 None。两处合起来才是完整的
+        # 「页面上看得到牧原自己披露的 11.7，而正身如实缺着」。
+
+    # ---- 批 9：tab 门控与「每头利润 / 估算总利润」这一格 -------------------- #
+    def _code(self, source):
+        """剥掉注释之后的源码——注释里可以引用被禁的字符串，可执行文本里不行。"""
+        code = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+        return re.sub(r"^\s*//.*$", "", code, flags=re.M)
+
+    def test_the_industry_tab_is_gated_on_the_payload_flag(self):
+        """那个 tab 只对 ``is_pig_company`` 为真的股票出现，**判据只有一份**。
+
+        判据在载荷里（``research/engine.py`` 的 ``_pig_mark``），前端不按行业名
+        自己判一次——两把尺子会造出「弹窗问你这只股票的三个数、页面上却没有这个
+        tab」的状态。``TABS`` 本身不动：它答的是「有哪些页」，不是「这只股票看
+        得到哪些页」。
+        """
+        with io.open(JS_PATH, encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertIn("state.currentDetail.is_pig_company", source,
+                      "tab 的门控必须读载荷下发的那个布尔")
+        self.assertIn("TABS.filter((tab) => tab !== PIG_TAB || pigTabVisible())",
+                      source, "过滤发生在渲染那一刻，不改 TABS 本身")
+        self.assertIn("normalizeTab();", source,
+                      "URL 直达 / 上一只留下的 tab 要回落，否则白发一次请求")
+        # 回落必须是**渲染前**的：`renderTab` 里再拦一次，免得有人绕过前两处
+        # 直接调用它（补录保存后就有一条这样的路径）。
+        self.assertGreaterEqual(source.count("normalizeTab();"), 3)
+
+    def test_the_profit_card_takes_every_number_from_the_payload(self):
+        """每头利润 / 估算总利润那一格：**词表与数字全部来自载荷**。
+
+        尤其那个换算系数：公式是后端写的字（``estimated_profit.formula``），
+        前端**不许**自己写一个 120 去乘——``RULES_V1`` 改一次，两边就会悄悄
+        不一致，而界面上那个数看起来完全正常。
+        """
+        with io.open(JS_PATH, encoding="utf-8") as handle:
+            source = handle.read()
+        code = self._code(source)
+        self.assertIn("core.estimated_profit", source)
+        for template in ("ep.missing_text", "ep.per_head", "ep.per_head_label",
+                         "ep.per_head_unit", "ep.volume_label", "ep.formula",
+                         "ep.label"):
+            self.assertIn(template, source, template)
+        # 数值渲染一律把这一格自己的缺口语传下去（与成本链同一条纪律）。
+        self.assertIn("pigNum(ep.value, ep.unit, ep.missing_text)", source)
+        self.assertIn("pigNum(ep.per_head, ep.per_head_unit, ep.missing_text)",
+                      source)
+        for banned in ("* 120", "× 120", "120kg/头", "120 kg"):
+            self.assertNotIn(banned, code,
+                             "换算系数与公式只在后端一份：前端写不得")
 
 
 if __name__ == "__main__":                                       # pragma: no cover

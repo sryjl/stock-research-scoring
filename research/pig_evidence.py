@@ -18,6 +18,7 @@
 from datetime import datetime
 
 from . import factors
+from . import pig_core
 from . import pig_industry_series as series
 from . import pig_observations as obs
 from . import pig_premium as premium
@@ -76,6 +77,59 @@ def _label_of(metric_id):
     return getattr(definition, "display_name", None)
 
 
+#: 缺失时的**统一措辞**。前端只读不写——同一件事在界面上有两种说法时，
+#: 用的人会以为它们是两件事。
+#:
+#: 批 8 起它只是 :data:`research.pig_core.MISSING_TEXT` 的**别名**：核心经营
+#: 数据那一块（三项 + 单位利润）也显示这句话，两份字符串迟早会分叉成两句。
+MISSING_TEXT = pig_core.MISSING_TEXT
+
+#: 成本链上**必须永远有一行**的格子：``(metric_id, 展示用的 variant)``。
+#:
+#: 为什么不靠 ``metrics`` 自然长出来：桶是从「读数指向的指标 ∪ 观测仓里有的
+#: 指标」现算的，而 ``cash_cost`` 既没有因子消费它、观测仓里也没有它的观测
+#: （语料里零披露），于是**它在载荷里根本不存在**——而「不存在的行」没法显示
+#: 「未获取可靠公开数据」，它会显得像这一格从来不需要。
+#:
+#: 这份清单与 ``pig_cost_core.REGISTERED_COST_GRID`` 是**两份**写法（层级方向
+#: 逼出来的：读侧不该 import 抽取器）。两份只有在「测试会响」的前提下才可接受
+#: ——``tests/test_pig_cost_core.py`` 有一条漂移测试逐条比对，见 ``rules.py``
+#: 对死副本的说明。
+COST_GRIDS = (
+    (_pig.M_FULL_COST, "COMPLETE_COST_PER_KG"),
+    (_pig.M_FULL_COST, "FULL_COST_COMPANY_DISCLOSED"),
+    (_pig.M_FATTENING_COST, "fattening_full_cost_per_kg"),
+    (_pig.M_CASH_COST, "cash_cost_per_kg"),
+    (_pig.M_WEANED_PIGLET_COST, "weaned_piglet_cost"),
+)
+
+
+def _cost_grids(metrics):
+    """成本格 → 载荷。``preferred`` 取该 ``(metric_id, variant)`` 里**最新一期**的
+    首选，用的是**已有的** :func:`_newer_than`，不引入第二套排序。
+
+    没有观测就是 ``None``——**不许合成一个值**，也**不许**拿同指标另一个 variant
+    的值顶上：``fattening_cost_per_kg`` 与 ``fattening_full_cost_per_kg`` 是两个
+    口径，界面上一行显示另一个口径的数，比显示「没有」糟糕得多。
+    """
+    out = []
+    for metric_id, variant in COST_GRIDS:
+        definition = _pig.METRIC_INDEX.get(metric_id)
+        bucket = metrics.get(metric_id) or _empty_bucket(metric_id)
+        best = None
+        for summary in bucket["preferreds"]:
+            if summary.get("metric_variant") != variant:
+                continue
+            if best is None or _newer_than(summary, best):
+                best = summary
+        out.append({"metric_id": metric_id, "metric_label": _label_of(metric_id),
+                    "metric_variant": variant,
+                    "unit": (definition.unit_of(variant)
+                             if definition is not None else None),
+                    "missing_text": MISSING_TEXT, "preferred": best})
+    return out
+
+
 def _empty_bucket(name):
     """指标桶的空骨架。**键固定**：前端不为「有数据 / 没数据」写两条读取路径。"""
     return {"metric_id": name, "metric_label": _label_of(name), "preferred": None,
@@ -95,13 +149,43 @@ def _reading_metrics(state):
     return out
 
 
-def _series_metrics(conn):
-    """行业序列里出现过的指标 id（一行 SQL，不去重读全表）。"""
+def _series_metrics(conn, cfg=None):
+    """行业序列里出现过的指标 id，**且读侧还接它**（一行 SQL，不去重读全表）。
+
+    为什么要取交集：停抓一个指标（批 9 起是仔猪价与白条价）**不等于它的历史
+    消失**——库里的 2524 行一行没删，所以光看 ``SELECT DISTINCT metric_id``
+    会把它们照样捞回来、照样铺到页面上，「已经不抓了」就成了一句空话。
+    **停抓与不再展示必须同时改**，这是第三处（另两处见
+    ``pig_industry_series.series_types`` 与 ``pig_readings.series_targets``）。
+    """
+    got = {name for name, _variant, _region in
+           pig_readings.series_targets(cfg or ())}
     try:
         return [row[0] for row in conn.execute(
-            "SELECT DISTINCT metric_id FROM pig_industry_series")]
+            "SELECT DISTINCT metric_id FROM pig_industry_series")
+            if row[0] in got]
     except Exception:                                              # noqa: BLE001
         return []
+
+
+def _visible(items, visible):
+    """主视区白名单过滤，按每一项的 ``metric_id`` 判定去留。
+
+    既能吃**字典**（``readings``：键是 factor_id）也能吃**列表**（``cost_grids``：
+    一堆 ``{metric_id, ...}``），因为两处的调用方写起来是一样的，为它们各写一份
+    过滤只会让「哪一处忘了滤」变成一个不显眼的 bug。
+
+    ``visible`` 为 ``None`` = 不过滤（那条路径是**证据下钻**，不是主视区）。
+    读数没有 ``metric_id``（复合因子，例如 ``pig_exposure``）时一并滤掉——
+    「复合」不是留下的理由，这一批要留的是能回答「单位利润 × 出栏规模」的那几项。
+    """
+    if visible is None:
+        return items
+    if isinstance(items, dict):
+        return {key: item for key, item in items.items()
+                if (item or {}).get("metric_id") in visible}
+    return [item for item in items
+            if (item or {}).get("metric_id") in visible]
 
 
 def _newer_than(left, right):
@@ -282,21 +366,67 @@ def build(conn, code, *, metric_id=None, period=None, cfg=None, candidates=True)
     # 指标桶**不止于观测仓里有的那些**：读数指向的指标（全国价那一格来自行业序列，
     # 成本那几格什么都没有）也各有一个桶，哪怕它是空的——「这一格什么都没有」与
     # 「这一格没被列出来」是两件事，界面上必须分得开。
-    series_names = set(_series_metrics(conn))
-    for name in sorted(set(metrics) | series_names | _reading_metrics(state)):
+    #
+    # 批 7 补了一类：``COST_GRIDS`` 那几格**要显式播种**。``cash_cost`` 既没有
+    # 因子消费它、观测仓里也没有它的观测（语料里零披露），所以它既不在
+    # ``_reading_metrics`` 里也不在 ``metrics`` 里——不播种就根本没有这一行。
+    #
+    # 批 9 再补一类：**核心三项**也要显式播种。第三项换成商品猪口径之后，
+    # 消费它的只有 ``capacity_delivery`` 一个因子，而那是 display_only 的
+    # （``factor_curves`` 是空的）——实测载荷里根本长不出 ``commodity_hog_sales_volume``
+    # 这个桶，于是**核心卡片上写着「未获取可靠公开数据」，下面那张表里连这一行
+    # 都没有**，002714 库里那条 622.7 万头也点不开。卡片与表是同一个数的两种
+    # 排版，「上面说没有、下面查不到」正是这一批要防的自相矛盾。
+    series_names = set(_series_metrics(conn, cfg))
+    # 主视区白名单（批 9，见 ``pig.DISPLAY_METRIC_IDS``）。**显式点名 metric_id
+    # 时不过滤**：那条路径是证据下钻（界面上点开某一行看它的全部候选），不是
+    # 主视区。把下钻也挡掉，就等于「不再显示」变成了「查不到」，而这一批说的是
+    # **退役展示不是删除**——观测、证据、下钻入口一样都在。
+    visible = None if metric_id else set(_pig.DISPLAY_METRIC_IDS)
+    wanted = (set(metrics) | series_names | _reading_metrics(state)
+              | {mid for mid, _variant in COST_GRIDS}
+              | set(_pig.CORE_PIG_METRIC_IDS))
+    if visible is not None:
+        wanted &= visible
+    for name in sorted(wanted):
         metrics.setdefault(name, _empty_bucket(name))
         if name in series_names:
             points, skipped = _series_of(conn, name, cfg, min_points=min_points)
             metrics[name]["series"] = points
             metrics[name]["series_skipped"] = skipped
+    # 核心经营数据（批 8）：三项 + 单位利润 + 人工录入条目。**不是第二套读数**——
+    # 它读的就是上面那份 ``store``（``pig_core.snapshot`` 自己走 ``pig_readings.load``），
+    # 所以「卡片上的数」与「证据里的数」不可能来自两次不同的判断。
+    core = pig_core.snapshot(conn, code, cfg=cfg)
+    # 主视区那份 ``metrics`` **也要过白名单**。上面第 389 行只挡住了「新播种」，
+    # 而桶主要是从**观测**长出来的（第 301 行），退役指标在库里本来就有观测，
+    # 于是它们照旧各占一行「读数不消费」。实测 002714：白名单 5 项里只有 4 项有
+    # 读数行，另有 **7 行**退役指标（均重 / 种猪销量 / 屠宰量 / 仔猪销量 / 售价溢价 /
+    # 合计口径出栏量）铺在主视区——这正是「现在计算的东西太多了」那一句。
+    # **测试看不见它**：夹具里退役指标一条观测都没有，于是 `assertNotIn(...)` 一直
+    # 是绿的，而真库里有（与 §11.23.7 同一种盲区）。
+    # 注意 `_cost_grids` 用的是上面那份**未过滤**的 ``metrics``（它对缺桶回落空骨架），
+    # 所以这一行必须放在它之后、且只改**发出去**的那一份。
+    shown = _visible(metrics, visible)
     payload = {
         "code": code,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "rule_version": getattr(_pig.rules, "RULE_VERSION", None),
-        "readings": _labelled_readings(state.get("readings") or {}),
-        "metrics": metrics,
+        "readings": _visible(_labelled_readings(state.get("readings") or {}),
+                             visible),
+        "metrics": shown,
+        # 是否猪企 + 三项收敛的现状。**界面上的「补充核心经营数据」入口由
+        # ``is_pig_company`` 决定**：不是猪企的股票不该看见一个问猪价的按钮。
+        "is_pig_company": core["is_pig_company"],
+        "pig_core": core,
+        # 成本链那几行：**一条不藏**同样适用于「一格都没有」——见 :data:`COST_GRIDS`。
+        # 批 9 起成本链**只剩完全成本那两格**（正身 + 旁证）。``_cost_grids``
+        # 对缺桶会回落到 ``_empty_bucket``，所以光过滤 ``metrics`` 不够——
+        # 那会让肥猪成本 / 现金成本 / 断奶仔猪成本照旧各占一空行。
+        "cost_grids": _visible(_cost_grids(metrics), visible),
         "counts": {
-            "metrics": len(metrics), "candidates": counts["candidates"],
+            # 与上面那张表一致：页脚写「指标 N 个」，N 就该是**表上那几个**。
+            "metrics": len(shown), "candidates": counts["candidates"],
             "preferred": counts["preferred"], "conflicts_group_pairs":
                 counts["conflicts"],
             "observations": len(rows), "store": store["counts"],

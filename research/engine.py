@@ -13,6 +13,7 @@ from . import audit_job
 from . import db, dimensions, factor_store, industry_map, industry_margin
 from . import market_series, peer_groups, router, rules, series
 from . import factors as factor_layer
+from . import pig_core
 from .industry import pig as pig_industry
 from . import valuation_anchors, valuation_history
 from .providers import get_provider, ttm_periods
@@ -24,6 +25,67 @@ FIN_CACHE_VERSION = 3
 
 # 历史序列覆盖的完整年度数
 HISTORY_YEARS = 5
+
+# --------------------------------------------------------------------------- #
+# 持久化模式（批 6 §六–§十）
+#
+# 在批 6 之前，**「调用 analyze()」就等于「写历史」**：测试、dry-run 试算、A/B
+# 对拍与正式落库走的是同一条路径，没有任何办法把它们分开。后果是实打实的——
+# 想看一眼「换个权重会打几分」，就得先往 research_snapshots 里写一行真快照。
+#
+# 现在落库要**显式开口**：默认 DRY_RUN，生产三处（server.py 的 analyze/refresh
+# 与 audit_job.py 的补分）显式传 MODE_PERSIST。分界线不是「读还是写」，而是
+# **写的是结论还是输入**：
+#
+#   * **结果**（research_snapshots / model_route_snapshot / research_stocks /
+#     factor_*）：这是历史，是「那一刻我们给出的结论」。只有 PERSIST 能写。
+#   * **输入缓存**（financial_cache / valuation_history* / peer_group* /
+#     market_series* / market_overhang）：这是「我们查过什么」。DRY_RUN 写它
+#     不产生任何历史，只是让下一次试算不必重复联网。
+# --------------------------------------------------------------------------- #
+
+#: 生产落库：结果表 + 输入缓存都写。
+MODE_PERSIST = "PERSIST"
+#: 试算（**默认**）：不写任何历史，可以顺手落输入缓存。
+MODE_DRY_RUN = "DRY_RUN"
+#: 测试：结果与缓存都不写，上下文也不取（零写、零联网）。
+MODE_TEST = "TEST"
+#: A/B 对拍：同 TEST，但输入全部来自 :func:`freeze_market` 的同一份冻结包。
+MODE_COMPARE = "COMPARE"
+
+MODES = (MODE_PERSIST, MODE_DRY_RUN, MODE_TEST, MODE_COMPARE)
+
+#: 会写**结果**的模式。
+_WRITES_RESULTS = frozenset({MODE_PERSIST})
+#: 会写**输入缓存**的模式。
+_WRITES_INPUT_CACHE = frozenset({MODE_PERSIST, MODE_DRY_RUN})
+
+
+def _check_mode(mode):
+    """认不认识这个模式。**不认识就抛**——静默降级成不写或全写都是骗人。"""
+    if mode not in MODES:
+        raise ValueError("未知的持久化模式 %r，只认 %s" % (mode, " / ".join(MODES)))
+    return mode
+
+
+def writes_results(mode):
+    """这个模式会不会写历史（快照 / 主记录 / 路由 / 因子层）。"""
+    return _check_mode(mode) in _WRITES_RESULTS
+
+
+def writes_input_cache(mode):
+    """这个模式会不会写输入缓存（财务缓存 / 估值历史 / 同业 / 市场序列）。"""
+    return _check_mode(mode) in _WRITES_INPUT_CACHE
+
+
+def _empty_context():
+    """没有任何外部上下文时的四组空值。
+
+    每次**新建**（不是一个共享常量）：``pe_series`` 是 list，传同一个对象出去，
+    下游谁顺手 ``append`` 一下就会污染下一次调用。
+    """
+    return {"peer": None, "market": None, "pe_series": [],
+            "pig": None, "unmapped_industries": []}
 
 
 def _now():
@@ -708,7 +770,24 @@ def _run_analysis(m, context=None):
     return result
 
 
-def analyze(code, force_financials=False, note=None, baseline_tag=None):
+def _pig_mark(code, industry):
+    """「这是不是一只猪企」——**与 ``pig_core`` 同一把尺子**，同步下发。
+
+    为什么列表 / 详情要再给一个布尔：前端决定「要不要显示『猪行业数据』这个
+    tab」时，手上只有这一份载荷。此前它只能靠 ``cohort``
+    （``industry_margin.COHORTS["pig"]``，4 个显式成员）判断，而首次研究的
+    补录弹窗用的是 ``pig_core.is_pig_company``（peer 组 + 已建档成员表，
+    **更宽**）。两把尺子并存会造出一个自相矛盾的状态：**弹窗问你这只新股票的
+    猪价，页面上却没有那个 tab**。所以让 tab 与弹窗同源。
+
+    ``cohort`` / ``cohort_label`` 原样保留——行业毛利那一块还在用它，
+    本批不动那条链。两套判据的**真正合并**是后续项（见 SCORING_STRUCTURE §11.24）。
+    """
+    return {"is_pig_company": pig_core.is_pig_company(code, industry)}
+
+
+def analyze(code, force_financials=False, note=None, baseline_tag=None,
+            mode=MODE_DRY_RUN, frozen=None):
     """分析一只股票。返回完整结果 dict。
 
     **门禁在最前面**：这只股票还没有可用的资产语义快照时，不给分数——先把它排进
@@ -726,54 +805,85 @@ def analyze(code, force_financials=False, note=None, baseline_tag=None):
     「这一次为什么重算」，后者说「这一批 run 属于哪一代 baseline」。两者都
     **不进** factor hash（见 factor_store 的 docstring），所以加一句备注不会
     白增一行 run，也不会改分数。
+
+    ``mode`` 见本模块顶部的模式说明。**默认 `DRY_RUN`**——光调这个函数不等于
+    「写历史」，落库要显式传 ``MODE_PERSIST``。返回的 dict 里多两个自述字段
+    ``mode`` 与 ``persisted``，方便调用方（和日志）说清楚这一次到底写没写。
+    未知模式**直接抛 ValueError**，不静默降级。
+
+    ``frozen`` 是 :func:`freeze_market` 的产物：给了它就不再联网、不读缓存，
+    输入全部来自这一份包（A/B 两臂传**同一个对象**）。它只对
+    ``MODE_COMPARE`` 有意义，别的模式给了会被忽略——不是错误，但那是调用方
+    想错了，所以下面显式只认 COMPARE。
     """
+    _check_mode(mode)
     conn = db.connect()
     try:
+        quote = frozen.get("quote") if frozen else None
         status = audit_job.status_of(conn, code)
         if status != audit_job.OK:
-            return _begin_audit(conn, code, status)
+            return _begin_audit(conn, code, status, mode=mode, quote=quote)
 
-        p = get_provider()
-        quote = p.get_quote(code)
-
-        # 财务数据：优先用缓存，除非强制/新财报（轻量检查最新报告期）
-        cached = db.get_financial_cache(conn, code)
-        latest_fresh = p.get_latest_report_period(code)
-
-        # 最新报告期检查本身也依赖外部网络。检查失败时优先保留已验证的缓存，
-        # 不把“暂时查不到”误判为“必须重新抓取”。
-        use_cache = (not force_financials and _is_fresh_cache(cached)
-                     and (latest_fresh is None
-                          or cached.get("latest_report_period") == latest_fresh))
-        financials_refreshed = False
-        if use_cache:
-            fin = cached["data"]
+        if frozen is not None and mode == MODE_COMPARE:
+            quote = frozen["quote"]
+            fin = frozen["financials"]
+            financials_refreshed = bool(frozen.get("financials_refreshed"))
+            assets = frozen["assets"]
+            pb_history = frozen["pb_history"]
         else:
-            fresh_fin = fetch_financials(code)
-            if _has_usable_financials(fresh_fin):
-                fin = fresh_fin
-                db.set_financial_cache(conn, code, fin, latest_fresh)
-                financials_refreshed = True
-            elif cached is not None:
-                # 强制刷新也不能用空响应覆盖历史缓存。
+            p = get_provider()
+            quote = p.get_quote(code)
+
+            # 财务数据：优先用缓存，除非强制/新财报（轻量检查最新报告期）
+            cached = db.get_financial_cache(conn, code)
+            latest_fresh = p.get_latest_report_period(code)
+
+            # 最新报告期检查本身也依赖外部网络。检查失败时优先保留已验证的缓存，
+            # 不把“暂时查不到”误判为“必须重新抓取”。
+            use_cache = (not force_financials and _is_fresh_cache(cached)
+                         and (latest_fresh is None
+                              or cached.get("latest_report_period") == latest_fresh))
+            financials_refreshed = False
+            if use_cache:
                 fin = cached["data"]
             else:
-                # 首次研究且数据源不可用时保留原有“数据不足”的展示行为，
-                # 但不缓存空结果，方便下次恢复后重新抓取。
-                fin = fresh_fin
+                fresh_fin = fetch_financials(code)
+                if _has_usable_financials(fresh_fin):
+                    fin = fresh_fin
+                    # 缓存是「我们查过什么」，不是结论。DRY_RUN 写它不产生历史。
+                    if writes_input_cache(mode):
+                        db.set_financial_cache(conn, code, fin, latest_fresh)
+                    financials_refreshed = True
+                elif cached is not None:
+                    # 强制刷新也不能用空响应覆盖历史缓存。
+                    fin = cached["data"]
+                else:
+                    # 首次研究且数据源不可用时保留原有“数据不足”的展示行为，
+                    # 但不缓存空结果，方便下次恢复后重新抓取。
+                    fin = fresh_fin
 
-        assets = asset_metrics.load(conn, code)
-        # 估值历史（PB 月末序列）。ensure 内部自己判新鲜度：同一天只试一次、
-        # 上一个完整月已覆盖就不联网、口径版本变了就重抓；取不到时**不抛异常**
-        # 也不删旧行，返回已有缓存（首次就是空），PB 分位那一格据此标 missing。
-        valuation_history.ensure(conn, code)
+            assets = asset_metrics.load(conn, code)
+            # 估值历史（PB 月末序列）。ensure 内部自己判新鲜度：同一天只试一次、
+            # 上一个完整月已覆盖就不联网、口径版本变了就重抓；取不到时**不抛异常**
+            # 也不删旧行，返回已有缓存（首次就是空），PB 分位那一格据此标 missing。
+            if writes_input_cache(mode):
+                valuation_history.ensure(conn, code)
+            pb_history = valuation_history.pb_series(conn, code)
+
         m, report_period, industry = build_metrics(
             code, quote, fin, assets, industry_margin=_industry_margin(code),
-            pb_history=valuation_history.pb_series(conn, code))
-        # 相对价值与 MARKET 要联网取外部数据（peer 快照 / 日线 / 筹码），
-        # 所以上下文在这里建——这一条路径有 conn，`_run_analysis` 保持纯函数。
-        context = _research_context(conn, code, industry,
-                                    (quote or {}).get("float_market_cap"))
+            pb_history=pb_history)
+        if frozen is not None and mode == MODE_COMPARE:
+            context = frozen.get("context") or _empty_context()
+        elif writes_input_cache(mode):
+            # 相对价值与 MARKET 要联网取外部数据（peer 快照 / 日线 / 筹码），
+            # 所以上下文在这里建——这一条路径有 conn，`_run_analysis` 保持纯函数。
+            context = _research_context(conn, code, industry,
+                                        (quote or {}).get("float_market_cap"))
+        else:
+            # TEST：不取上下文就不必联网，也一个字都不写。那一组因子如实报
+            # missing_data（不进分母），而不是让一次测试把真库的同业缓存刷新掉。
+            context = _empty_context()
         result = _run_analysis(m, context=context)
         result["code"] = code
         result["name"] = (quote or {}).get("name")
@@ -784,13 +894,78 @@ def analyze(code, force_financials=False, note=None, baseline_tag=None):
         result["financial_updated_at"] = _now()
 
         _persist(conn, code, quote, m, result, report_period, industry, financials_refreshed,
-                 note=note, baseline_tag=baseline_tag)
+                 note=note, baseline_tag=baseline_tag, mode=mode)
+        result["mode"] = mode
+        result["persisted"] = writes_results(mode)
         return result
     finally:
         conn.close()
 
 
-def _begin_audit(conn, code, status):
+def freeze_market(code, force_financials=False, mode=MODE_DRY_RUN):
+    """把一次分析的**全部外部输入**取下来冻住，供 A/B 两臂共用。
+
+    A/B 对拍的头号敌人是「两臂输入不一样」：行情每次 analyze **现联网取、无缓存**
+    （``providers.EastmoneyProvider.get_quote``，没有任何一层兜住），两臂各取一次
+    就够让价格错开，结果自然不可比——而出来的差异会被当成「改动带来的变化」。
+
+    这里联网取**一次**，冻结成一份普通 dict：``quote`` / ``financials`` /
+    ``financials_refreshed`` / ``assets`` / ``pb_history`` / ``context`` /
+    ``generated_at``。之后 ``analyze(..., mode=MODE_COMPARE, frozen=bundle)``
+    两臂传**同一个对象**，不再联网、不读缓存、不写任何表。
+
+    ``mode`` 决定这一步自己写不写输入缓存：默认 ``DRY_RUN``（缓存照落，历史不落）
+    ——冻结是把「此刻能读到的东西」定住，顺手把缓存刷新到最新反而让对拍更有意义。
+    要严格零写就传 ``MODE_TEST``，代价是 ``context`` 只能是空的。
+
+    返回的 ``assets`` 与 ``context`` 是对象，不是纯数据；``bundle`` 是给
+    ``analyze`` 原样传回去用的，不要自己拼。
+    """
+    _check_mode(mode)
+    conn = db.connect()
+    try:
+        p = get_provider()
+        quote = p.get_quote(code)
+        cached = db.get_financial_cache(conn, code)
+        latest_fresh = p.get_latest_report_period(code)
+        use_cache = (not force_financials and _is_fresh_cache(cached)
+                     and (latest_fresh is None
+                          or cached.get("latest_report_period") == latest_fresh))
+        financials_refreshed = False
+        if use_cache:
+            fin = cached["data"]
+        else:
+            fresh_fin = fetch_financials(code)
+            if _has_usable_financials(fresh_fin):
+                fin = fresh_fin
+                financials_refreshed = True
+            elif cached is not None:
+                fin = cached["data"]
+            else:
+                fin = fresh_fin
+        assets = asset_metrics.load(conn, code)
+        if writes_input_cache(mode):
+            valuation_history.ensure(conn, code)
+        pb_history = valuation_history.pb_series(conn, code)
+        # 上下文要 ``industry``，而 ``industry`` 由 build_metrics 从**同一批输入**
+        # 推出来（纯函数）。这里算一次只为拿它；analyze 拿冻结包再算一次得到的是
+        # 同一个值，两边的 context 因此对得上。
+        _, _, industry = build_metrics(
+            code, quote, fin, assets, industry_margin=_industry_margin(code),
+            pb_history=pb_history)
+        if writes_input_cache(mode):
+            context = _research_context(conn, code, industry,
+                                        (quote or {}).get("float_market_cap"))
+        else:
+            context = _empty_context()
+        return {"code": code, "generated_at": _now(), "quote": quote,
+                "financials": fin, "financials_refreshed": financials_refreshed,
+                "assets": assets, "pb_history": pb_history, "context": context}
+    finally:
+        conn.close()
+
+
+def _begin_audit(conn, code, status, mode=MODE_PERSIST, quote=None):
     """未审计的股票：排队 + 只落一行状态，**不给分数**。
 
     ⚠ 这个函数里**不许调用路由**（``router.route``）：「一次分析只算一次路由」在
@@ -803,16 +978,23 @@ def _begin_audit(conn, code, status):
 
     已经在跑（``RUNNING``）就不再写一次状态：那条 UPDATE 会把 ``audit_started_at``
     重置成现在，把排队顺序打乱。
+
+    ``mode`` 不是 ``PERSIST`` 时**只算不写**：不落主记录、不标状态、不进队列
+    （``audit_job.notify()`` 是把审计线程叫起来，那本身就是写历史的行为）。
+    返回的形状一模一样，所以试算/测试拿到的还是「审计中」那条结果——它照样
+    没有分数，只是没在库里留下痕迹。``quote`` 给 frozen 包用；不给就自己取。
     """
-    quote = get_provider().get_quote(code)
-    # 顺序不能反：新股票的**主记录还不存在**，而审计状态存在 research_stocks 的
-    # 列上——先 mark 是一条 UPDATE 0 行的空操作，状态就丢了（列表里显示成「未审计」
-    # 而不是「审计中」）。先把行落下来（upsert_stock 不写那五列，不会覆盖状态），
-    # 再写状态。
-    _persist_gated(conn, code, quote)
-    if status != audit_job.RUNNING:
-        db.mark_stock_audit(conn, code, audit_job.RUNNING)
-        audit_job.notify()
+    if quote is None:
+        quote = get_provider().get_quote(code)
+    if writes_results(mode):
+        # 顺序不能反：新股票的**主记录还不存在**，而审计状态存在 research_stocks 的
+        # 列上——先 mark 是一条 UPDATE 0 行的空操作，状态就丢了（列表里显示成「未审计」
+        # 而不是「审计中」）。先把行落下来（upsert_stock 不写那五列，不会覆盖状态），
+        # 再写状态。
+        _persist_gated(conn, code, quote, mode=mode)
+        if status != audit_job.RUNNING:
+            db.mark_stock_audit(conn, code, audit_job.RUNNING)
+            audit_job.notify()
     row = db.get_stock(conn, code) or {}
     label = audit_job.label_of(audit_job.RUNNING)
     return {
@@ -828,13 +1010,18 @@ def _begin_audit(conn, code, status):
     }
 
 
-def _persist_gated(conn, code, quote):
+def _persist_gated(conn, code, quote, mode=MODE_PERSIST):
     """落一行「还没审计」的主记录：身份 + 价格，其余一概 NULL。
 
     分数、画像、路由、财务摘要、报告期一个都不写。``upsert_stock`` 的
     ``ON CONFLICT SET`` 会把这些列覆盖成 NULL，所以**门禁上线之前落下的、
     带着分数的未审计行**（600502 就是）下次分析时自动被清干净。
+
+    门禁：``mode`` 不写结果时它**也是**一行都不写的——「未审计」这条状态本身
+    就在 ``research_stocks`` 里，属于历史。
     """
+    if not writes_results(mode):
+        return
     q = quote or {}
     prev = db.get_stock(conn, code) or {}
     now = _now()
@@ -926,7 +1113,19 @@ def _with_cyclical_breakdown(fin, result):
 
 
 def _persist(conn, code, quote, m, result, report_period, industry, financials_refreshed,
-             note=None, baseline_tag=None):
+             note=None, baseline_tag=None, mode=MODE_PERSIST):
+    """结果表的**单一收口**：快照、路由快照、主记录、因子层、清审计状态。
+
+    门禁在最前面：``mode`` 不写结果时整段跳过。把门禁放在这里而不是
+    :func:`analyze` 的调用点上，是因为结果表的写点全在这一个函数里——将来谁
+    再加一条调用路径（批量跑、回补脚本），它只要走 ``_persist`` 就自动被管住。
+
+    默认 ``MODE_PERSIST`` 是**刻意**的：本函数是「把这次的结果落下去」这个动作
+    本身，直接调它的既有测试与脚本要的还是这个语义。默认值在 :func:`analyze`
+    那一层才收紧（那里默认 DRY_RUN）。
+    """
+    if not writes_results(mode):
+        return
     q = quote or {}
     typ = result["type"]
     fin = result["final"]
@@ -1266,6 +1465,7 @@ def list_stocks():
             # 「猪企」这类组合标记：纯字典查表（绝不用 load()，那要扫目录）。
             # 上面那段门禁**不清**它——它是身份事实，与 industry / price 同类。
             rec.update(industry_margin.cohort_mark(r["code"]))
+            rec.update(_pig_mark(r["code"], r["industry"]))
             # factor 层摘要（列表页只给轻量版，整层在详情页）。挂在这里是为了让
             # **门禁最后一遍**把它一起挡掉：未审计的股票不该看到研究总览分。
             _with_factor_state(rec, summaries.get(r["code"]))
@@ -1481,6 +1681,7 @@ def get_stock(code):
         _with_canonical_metrics(out, out["valuation"])
         out.update(route_fields(r))
         out.update(industry_margin.cohort_mark(code))
+        out.update(_pig_mark(code, out.get("industry")))
         # 详情页挂**整层**：库里存的是当时的测量列，group / dimension / overview
         # 那一层用同一份 dimensions.evaluate 重建（见 factor_store.load_layer）。
         _with_factor_state(out, factor_store.load_layer(conn, code), full=True)

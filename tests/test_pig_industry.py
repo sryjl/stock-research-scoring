@@ -73,15 +73,25 @@ def _state(**kwargs):
 class TestMetricVocabulary(unittest.TestCase):
 
     def test_the_vocabulary_is_the_declared_ids_and_nothing_else(self):
-        """格数 = 批 5 的用户清单 22 格 + 批 5.1 按 spec 拆出的 9 格。
+        """格数 = 批 5 的用户清单 22 格 + 批 5.1 按 spec 拆出的 9 格 + 批 7 的 1 格。
 
         这条断言防的从来不是数字本身，而是**「多一格就是新造指标」**。所以
-        批 5.1 加格子的同时必须说清每一格拆自哪里、混用会给出什么错的答案
-        （写在 ``BATCH_5_1_METRIC_IDS`` 上面的分块注释里）；只要答不上来，
-        就不该加。数量与那 9 格的清单一起钉住，改动必须同时改这里。
+        加格子的同时必须说清每一格拆自哪里、混用会给出什么错的答案
+        （写在 ``BATCH_5_1_METRIC_IDS`` 与 ``BATCH_7_METRIC_IDS`` 上面的
+        分块注释里）；只要答不上来，就不该加。数量与清单一起钉住，改动必须
+        同时改这里。
+
+        批 7 那一格（断奶仔猪成本）加的理由与前面几批不同：它**不是**从一个
+        已有的格里拆出来的，而是本地语料里真有一条披露才建的（裁定 2：
+        「只建真有数据的格子」）。它的量纲是**元/头**，与所有 ``CNY/kg`` 的
+        成本格不同源——拿它和完全成本做加减是量纲错误，所以它必须独立成格。
         """
         self.assertEqual(len(PIG.BATCH_5_1_METRIC_IDS), 9)
-        self.assertEqual(len(PIG.METRIC_IDS), 22 + 9)
+        self.assertEqual(len(PIG.BATCH_7_METRIC_IDS), 1)
+        self.assertEqual(len(PIG.METRIC_IDS), 22 + 9 + 1)
+        self.assertIn(PIG.M_WEANED_PIGLET_COST, PIG.METRIC_IDS)
+        self.assertNotIn(PIG.M_WEANED_PIGLET_COST, PIG.BATCH_5_1_METRIC_IDS,
+                         "批 7 的格子不许混进批 5.1 的清单")
         self.assertEqual(len(set(PIG.METRIC_IDS)),
                          len(PIG.METRIC_IDS), "metric_id 不许重名")
         self.assertEqual(sorted(PIG.METRIC_INDEX), sorted(PIG.METRIC_IDS))
@@ -103,16 +113,20 @@ class TestMetricVocabulary(unittest.TestCase):
             self.assertIn(factor_id, F.FACTOR_INDEX,
                           "%s 不是 canonical factor" % factor_id)
 
-    def test_the_seven_opportunity_factors_come_from_the_adapter(self):
-        """7 个组成因子必须各自**在适配器里**声明依赖（除现金生存力外）。
+    def test_the_opportunity_factors_come_from_the_adapter(self):
+        """6 个组成因子必须各自**在适配器里**声明依赖（除现金生存力外）。
 
-        ``regional_premium`` 与 ``financial_survivability`` 是用户清单里的名字，
-        但它们的落点是**已有的** ``price_premium`` 与一个**零权重**的空依赖
-        factor——不新建重复 id，是「一个经济因素只声明一次」这条纪律的直接后果。
+        ``financial_survivability`` 是用户清单里的名字，但它的落点是一个
+        **零权重**的空依赖 factor——不新建重复 id，是「一个经济因素只声明一次」
+        这条纪律的直接后果。
+
+        **批 9 起只剩 6 个**：``regional_premium`` 当初的落点是已有的
+        ``price_premium``，用户裁定不要区域溢价之后那一格因子整个摘掉了
+        （见 ``research.dimensions.GROUP_FACTOR_WEIGHTS`` 同处的说明），
+        所以这里也少一个——两处不同批改就会留下一条永远查不出的空声明。
         """
-        want = {"margin_position", "price_position", "supply_contraction",
-                "cost_advantage", "capacity_delivery", "price_premium",
-                "financial_survivability"}
+        want = {"margin_position", "sale_price_level", "supply_contraction",
+                "cost_advantage", "capacity_delivery", "financial_survivability"}
         table = D.GROUP_FACTOR_WEIGHTS[F.GROUP_PIG_INDUSTRY]
         self.assertTrue(want <= set(table), sorted(want - set(table)))
         for factor_id in sorted(want):
@@ -252,10 +266,18 @@ class TestDisclosureHonesty(unittest.TestCase):
         self.assertTrue(obj.has_primary(PIG.M_PIG_ASSET_EXPOSURE))
 
     def test_every_source_type_has_a_declared_rank(self):
-        """缺来源类型按**最差**算，不是按最好。"""
-        self.assertEqual(len(PIG.SOURCE_PRIORITY), 7)
+        """缺来源类型按**最差**算，不是按最好。
+
+        批 8 加了**人工确认级**（``SRC_MANUAL``），位置是刻意的：排在 L2 月报
+        **之后**——定期报告与月报的自动值仍然优先，人工补录的值保留在冲突清单里
+        作旁证。``[-1]`` 仍是 ``SRC_DERIVED``（推算永远垫底）。
+        """
+        self.assertEqual(len(PIG.SOURCE_PRIORITY), 8)
         self.assertEqual(PIG.SOURCE_PRIORITY[0], PIG.SRC_ANNUAL_REPORT)
         self.assertEqual(PIG.SOURCE_PRIORITY[-1], PIG.SRC_DERIVED)
+        self.assertLess(PIG.SOURCE_RANK[PIG.SRC_MONTHLY_BULLETIN],
+                        PIG.SOURCE_RANK[PIG.SRC_MANUAL],
+                        "人工补录不许排在定期报告/月报之前")
         unknown = PIG.PigMetricRecord(PIG.M_PSY, status=PIG.STATUS_MISSING,
                                       source_type="??")
         self.assertEqual(unknown.source_rank, PIG.UNKNOWN_SOURCE_RANK)
@@ -313,7 +335,7 @@ class TestReadings(unittest.TestCase):
     def test_a_factor_with_a_missing_dependency_stays_missing(self):
         """「宁可 missing，不要伪精确」在**依赖**层面的落地：缺一格就整条缺。"""
         state = _state()
-        reading = state["readings"]["price_position"]
+        reading = state["readings"]["sale_price_level"]
         self.assertIsNone(reading["value"])
         self.assertEqual(sorted(reading["missing_metrics"]),
                          sorted([PIG.M_PIG_SALE_PRICE, PIG.M_NATIONAL_PIG_PRICE]))
@@ -336,7 +358,7 @@ class TestReadings(unittest.TestCase):
         self.assertTrue(price["source"], "一条读数必须指得出一个可核对的来源")
         self.assertEqual(len(price["inputs"]), 1)
         # 两个依赖的 factor 仍然缺国民价（位置要「公司价 vs 全国价」两把尺子）。
-        position = state["readings"]["price_position"]
+        position = state["readings"]["sale_price_level"]
         self.assertIsNone(position["value"])
         self.assertEqual(position["missing_metrics"], [PIG.M_NATIONAL_PIG_PRICE])
 

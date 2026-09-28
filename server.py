@@ -21,6 +21,7 @@ import research.audit_job as audit_job
 import research.db as research_db
 import research.engine as research_engine
 import research.factor_audit as factor_audit
+import research.pig_core as pig_core
 import research.pig_evidence as pig_evidence
 import research.router as router
 import research.rules as rules
@@ -286,12 +287,57 @@ class Handler(BaseHTTPRequestHandler):
                 if not code:
                     raise ApiError(400, "缺少股票代码")
                 force = bool(data.get("force_financials"))
-                # note / baseline_tag：这一次重算的两张标签，原样落到 factor run
-                # 那一行上。只做长度截断，不解释内容——它们不进任何哈希、不改分数，
-                # 所以放宽到「调用方自己负责写清楚」是安全的。
-                self._send_json(research_engine.analyze(
+                # 批 8：首次研究的猪企核心经营数据补录。**必须问在 analyze 之前**
+                # ——「首次」的判据就是库里还没有这一行，而 analyze（走门禁时由
+                # ``_persist_gated``）会把它落下来。落库之后这个条件**永久为假**，
+                # 所以「只弹一次」不需要任何「弹过没」的状态：刷新 / 重开详情 /
+                # 重新评分 / 重启服务都不满足它。
+                prompt = self._pig_core_prompt(code)
+                result = research_engine.analyze(
                     code, force, note=_label(data.get("note")),
-                    baseline_tag=_label(data.get("baseline_tag"))))
+                    baseline_tag=_label(data.get("baseline_tag")),
+                    # 生产入口**显式**落库：analyze 的默认已经是 DRY_RUN，
+                    # 这一行是「求过一次就进历史」这句承诺的唯一出处。
+                    mode=research_engine.MODE_PERSIST)
+                if prompt is not None:
+                    # **只挂在这条响应上**：不给库加列、不加状态机。前端关掉就是
+                    # 「暂不填写」，一个请求都不发，股票早已由上面这次 analyze 落库。
+                    if isinstance(result, dict):
+                        result = dict(result, pig_core_prompt=prompt)
+                self._send_json(result)
+                return
+            if method == "POST" and path == "/api/research/pig-core":
+                # 人工补录（批 8）：**唯一**的人工写入口。数据进既有的
+                # ``pig_metric_observation``，不新增平行表；`source_type` 一律是
+                # 人工确认级，所以它**永远是旁证**，不会升格 canonical、不进评分。
+                data = self._read_json()
+                code = (data.get("code") or "").strip()
+                items = data.get("items")
+                if not isinstance(items, list):
+                    raise ApiError(400, "缺少 items 清单")
+                pconn = research_db.connect()
+                try:
+                    out = pig_core.save(pconn, code, items)
+                finally:
+                    pconn.close()
+                # **一律 200**：传输本身成功了，失败的是「这几个字段不合法」，
+                # 而逐字段的错误要原样送到填写的人眼前。共用的 ``api()`` 前端
+                # 助手在非 2xx 时只抛一句 ``error``，这些字段级说明会被丢掉。
+                self._send_json(out)
+                return
+            if method == "POST" and path == "/api/research/pig-core/delete":
+                # 删人工补录。**服务端拒绝**自动抽取的行：人工入口只该管人工数据。
+                data = self._read_json()
+                code = (data.get("code") or "").strip()
+                handles = data.get("observation_hashes")
+                if not isinstance(handles, list):
+                    raise ApiError(400, "缺少 observation_hashes 清单")
+                pconn = research_db.connect()
+                try:
+                    out = pig_core.delete(pconn, code, handles)
+                finally:
+                    pconn.close()
+                self._send_json(out)      # 理由同 pig-core：错误要送到眼前
                 return
             if method == "POST" and path == "/api/research/refresh":
                 data = self._read_json()
@@ -299,7 +345,8 @@ class Handler(BaseHTTPRequestHandler):
                 scope = (data.get("scope") or "price")
                 if not code:
                     raise ApiError(400, "缺少股票代码")
-                research_engine.analyze(code, force_financials=(scope == "financials"))
+                research_engine.analyze(code, force_financials=(scope == "financials"),
+                                        mode=research_engine.MODE_PERSIST)
                 self._send_json(research_engine.get_stock(code))
                 return
             if method == "POST" and path == "/api/research/user-type":
@@ -365,6 +412,34 @@ class Handler(BaseHTTPRequestHandler):
         for n in names:
             if not str(data.get(n) or "").strip():
                 raise ApiError(400, f"缺少字段: {n}")
+
+    @staticmethod
+    def _pig_core_prompt(code):
+        """首次研究的猪企核心经营数据补录载荷；不需要问就 ``None``。
+
+        「首次」= ``research_stocks`` 里**还没有这一行**。库里没有持久化的
+        ``newly_added`` 标记，也不需要加一个：「有没有这一行」就是那个事实本身，
+        而 analyze（门禁路径的 ``_persist_gated``）会在这一次调用里把它落下来
+        ——于是这个条件在落库之后**永久为假**。
+
+        **调用方在 analyze 之前调它**，否则问的就不是「首次」。
+
+        整个函数**不抛异常**：补录是一次可选的追问，问不出来不该让分析主流程
+        失败（用户的安全约束：主流程必须继续）。失败时记一条 ``None`` 就等于
+        「这次不问」，与「这不是首次」在行为上一致，且不留任何痕迹。
+        """
+        try:
+            pconn = research_db.connect()
+        except Exception:                                          # noqa: BLE001
+            return None
+        try:
+            if research_db.get_stock(pconn, code) is not None:
+                return None       # 已有记录 → 不是首次 → 永不自动弹
+            return pig_core.pending_prompt(pconn, code)
+        except Exception:                                          # noqa: BLE001
+            return None
+        finally:
+            pconn.close()
 
     def _refresh_quotes(self, conn):
         data = self._read_json()

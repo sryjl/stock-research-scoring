@@ -272,8 +272,10 @@ class TestSimulatePriceMatchesAnalysis(unittest.TestCase):
             test.addCleanup(p.stop)
 
     def _analyze(self):
+        # 显式 MODE_PERSIST：批 6 起 analyze 默认 DRY_RUN，而这一组测的是
+        # 「库里存着的那一份」与模拟的一致性——不落库就无从比较。
         with mock.patch.object(engine, "get_provider", FakeProvider):
-            return engine.analyze(self.CODE)
+            return engine.analyze(self.CODE, mode=engine.MODE_PERSIST)
 
     def _stored_row(self):
         return research_db.get_stock(self.conn, self.CODE)
@@ -376,8 +378,8 @@ class TestNoSpuriousSnapshotRows(unittest.TestCase):
                                lambda *a, **k: {"peer": None, "market": None,
                                                 "unmapped_industries": []})
         with p1, p2, mock.patch.object(engine, "get_provider", FakeProvider):
-            engine.analyze("600502")
+            engine.analyze("600502", mode=engine.MODE_PERSIST)
             first = self.conn.execute("SELECT COUNT(*) FROM research_snapshots").fetchone()[0]
-            engine.analyze("600502")
+            engine.analyze("600502", mode=engine.MODE_PERSIST)
             second = self.conn.execute("SELECT COUNT(*) FROM research_snapshots").fetchone()[0]
         self.assertEqual(first, second, "同一个输入跑两遍白加了快照行")

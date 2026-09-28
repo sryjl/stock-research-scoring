@@ -167,19 +167,21 @@ def _records_from_observations(code, rows, cfg):
 
 #: 行业序列要接进读数的 ``(metric_id, variant, region)``。
 #:
-#: 全国价是**唯一进读数的序列来源**；区域价也建成记录，但**没有任何 factor 声明
-#: 消费它**——它只出现在证据载荷与区域溢价的 derivation 里。哪几个区域要接**不是
+#: 全国价比**区域价**先接：区域价也建成记录，但**没有任何 factor 声明消费它**
+#: ——它只出现在证据载荷与区域溢价的 derivation 里。哪几个区域要接**不是
 #: 写死的**：取 ``RULES_V1["pig"]["company_benchmark_mapping"]`` 里出现过的地区，
 #: 于是「再加一个省」只改那张映射表，不改这里（§六）。
+#:
+#: **批 9 起只剩生猪价格**：仔猪价与白条价不再需要（用户裁定），
+#: 上游也已停抓（``pig_industry_series.Yangzhu360Provider.series_types``）。
+#: 这里必须同步——**两处少改一处，库里已抓的历史仍会变成读数铺到页面上**。
 def series_targets(cfg):
     regions = []
     for entry in ((cfg or {}).get("company_benchmark_mapping") or {}).values():
         region = (entry or {}).get("region")
         if region and region not in regions:
             regions.append(region)
-    out = [(_pig.M_NATIONAL_PIG_PRICE, "national_avg_price", None),
-           (_pig.M_PIGLET_PRICE, "national_avg_price", None),
-           (_pig.M_WHITE_MEAT_PRICE, "national_wholesale_price", None)]
+    out = [(_pig.M_NATIONAL_PIG_PRICE, "national_avg_price", None)]
     out.extend((_pig.M_NATIONAL_PIG_PRICE, "provincial_avg_price", region)
                for region in regions)
     return out
@@ -333,7 +335,12 @@ def _bulletin_observations(conn, code):
 
 
 def _series(conn, cfg):
-    """行业序列 → 记录（全国价 / 仔猪价 / 白条价 + 映射表里出现过的区域价）。"""
+    """行业序列 → 记录（**批 9 起只有生猪价格**：全国 + 映射表里出现过的区域）。
+
+    仔猪价与白条价的记录**不再生成**（用户裁定不需要；抓侧也已停抓）。判据在
+    :func:`series_targets` 一处，本函数跟着它走——所以「不再显示」与「不再抓」
+    不会各改一半。库里已抓的那些行仍在（不删历史），只是这里不再读它们。
+    """
     out = []
     notes = []
     for metric_id, variant, region in series_targets(cfg):

@@ -149,7 +149,10 @@ def _audit_one(conn, code):
         # 口径切换点：这一只从「没有资产层」变成「有」。只写一次，供
         # engine._delta_score / _mark_legacy_snapshots 把审计之前的快照摘出去。
         db.mark_audit_ok(conn, code)
-    research_engine.analyze(code)      # 落分；_persist 里会 clear_stock_audit
+    # 落分；_persist 里会 clear_stock_audit。**显式** PERSIST：审计线程是生产
+    # 写侧，analyze 的默认（DRY_RUN）在这里必须被覆盖掉，否则审计跑完分数不进库，
+    # 用户会一直看到「审计中」。
+    research_engine.analyze(code, mode=research_engine.MODE_PERSIST)
 
 
 def run_once(conn):

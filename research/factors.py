@@ -944,7 +944,9 @@ COMPUTED_FACTOR_SPECS = (
                "公司披露的商品猪销售均价（元/公斤）", _POINT, DIRECTION_NEUTRAL,
                _SRC_PIG, "ratio",
                note="**与行业价的差**才说明问题（体重结构、区域、销售模式），"
-                    "所以两个都留着：均价本身不判好坏，差额进 ``price_premium``。",
+                    "所以两个都留着：均价本身不判好坏。批 9 之前这个差额还要"
+                    "折成一个分（``price_premium`` 售价溢价），那一格已摘——"
+                    "差额仍要**看得见**（两个价并排读），只是不再单独计一格。",
                role=ROLE_CHARACTERISTIC,
                role_reason="与行业价同理：售价高低是环境与结构的结果，"
                            "本身不是「这家公司好」的证据。"),
@@ -969,13 +971,12 @@ COMPUTED_FACTOR_SPECS = (
                note="用**同组中位数**而不是行业平均：猪企的成本分布右偏（少数"
                     "高成本企业拉高均值），均值会让所有公司看起来都很优秀。",
                role_reason=DIRECTION_MEANING[DIRECTION_HIGHER_BETTER]),
-    FactorSpec("price_premium", "售价溢价", GROUP_PIG_INDUSTRY, ("售价溢价",),
-               "公司销售均价相对同组公司中位数的偏离", _POINT,
-               DIRECTION_HIGHER_BETTER, _SRC_PIG, "percent",
-               note="溢价常来自销售模式与区域结构而不是品牌力，所以单独一格，"
-                    "**不并进成本优势**——两个不同的原因得出同一个「优势」会"
-                    "让归因变得不可能。",
-               role_reason=DIRECTION_MEANING[DIRECTION_HIGHER_BETTER]),
+    # 批 9 摘掉了 ``price_premium``（售价溢价 = 区域溢价）。它此前是六格权重里
+    # 的 0.10，量的正是「公司售价相对同组中位数」——用户裁定不要这一格：
+    # 「有销售均价 + 完全成本完全够用」。**摘的是这一格因子，不是它的数据**：
+    # ``M_REGIONAL_PREMIUM`` 的观测、派生与 GAP_REASONS 一条没删，只是不再有
+    # 任何 factor 消费它。要恢复的话，把它连同 ``GROUP_FACTOR_WEIGHTS`` 里那
+    # 一格一起加回来（权重需重新归一），不是只把这段注释解掉。
     FactorSpec("output_volume", "出栏量", GROUP_PIG_INDUSTRY, ("出栏量",),
                "公司当期生猪出栏量（万头）", _POINT, DIRECTION_HIGHER_BETTER,
                _SRC_PIG, "count",
@@ -1060,12 +1061,23 @@ COMPUTED_FACTOR_SPECS = (
                     "才是「机会」——水位说不出这件事。",
                role_reason="越低越好：单位毛利处在历史低位说明行业正在出清，"
                            "而买点恰恰落在盈利最差的时候。"),
-    FactorSpec("price_position", "售价周期位置", GROUP_PIG_INDUSTRY, (),
-               "公司销售均价与行业生猪价格在周期区间中的位置（低位 = 周期底部）",
+    # 批 6 改名：原名 ``price_position``，但审计发现这个读数**就是公司月报商品猪
+    # 均价的原始值（元/kg）**——与 ``company_sale_price`` 共用同一条
+    # ``M_PIG_SALE_PRICE`` 记录，只在 variant 后备上有差别。「周期位置 / 分位」
+    # 从来没被计算过（它只写在下面这句 note 里），而且因为 ``factor_curves`` 是空的，
+    # 这一格恒为 ``display_only``、不进任何分母。名字与内容不符会误导，
+    # 所以改成 ``sale_price_level``：它答的是「售价在哪」，不是「在周期的哪个位置」。
+    # 要真的算位置，得先有曲线和足够的观测，那是后面的事。
+    FactorSpec("sale_price_level", "售价水平", GROUP_PIG_INDUSTRY, (),
+               "公司销售均价与行业生猪价格的当前水平（元/kg）",
                _CYCLE_WINDOW, DIRECTION_LOWER_BETTER, _SRC_PIG, "ratio",
-               note="两个价一起看，是因为**两者都在低位**才是行业性底部；只有"
-                    "公司价低而行业价不低，那是这家公司自己的销售问题（区域、"
-                    "体重结构、销售模式），该进 ``price_premium`` 而不是这里。",
+               note="**当前读到的是原值，不是分位、不是周期位置**。要算「位置」需要"
+                    "一条有观测支撑的曲线（``factor_curves`` 现在是空的），在那之前"
+                    "这一格只展示、不参与评分。设计意图是：两个价一起看，因为"
+                    "**两者都在低位**才是行业性底部；只有公司价低而行业价不低，"
+                    "那是这家公司自己的销售问题（区域、体重结构、销售模式）——"
+                    "**不是这一格要答的问题**（批 9 之前它进 ``price_premium``，"
+                    "那一格已摘）。",
                role_reason="越低越好：售价处在周期低位是行业底部的标志，"
                            "方向与「售价高 = 现在赚得多」正好相反——所以它必须是"
                            "另一格，不能并进售价溢价。"),

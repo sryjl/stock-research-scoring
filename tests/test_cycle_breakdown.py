@@ -27,7 +27,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import research.db as research_db  # noqa: E402
-from research import audit_job, engine, industry_margin, rules  # noqa: E402
+from research import audit_job, engine, industry_margin, pig_core, rules  # noqa: E402
 from tests.test_research import _SYNTH_QUOTE, _synth_fin  # noqa: E402
 
 #: 快照里模块级一行的**完整**键集（shape 见 rules.final_score 的 detail 循环）。
@@ -195,6 +195,34 @@ class TestCohortReachesThePayload(unittest.TestCase):
         if NON_PIG not in rows:
             self.skipTest(f"{NON_PIG} 不在库里")
         self.assertNotIn("cohort", engine.get_stock(NON_PIG))
+
+    def test_the_pig_flag_is_the_same_ruler_as_the_dialog(self):
+        """「是不是这一组公司」在列表 / 详情里**与补录弹窗同一把尺子**。
+
+        ``pig_core.is_pig_company`` 比 ``cohort`` **更宽**（peer 组 + 已建档成员
+        表），而前端决定「要不要给这个 tab」时手上只有列表 / 详情那一份载荷。
+        两把尺子并存会造出一个自相矛盾的状态：**弹窗问你这只新股票的三个数，
+        页面上却没有那个 tab**。所以这里比的不是「看起来一样」，而是**同一个
+        函数**的返回值，逐只比。
+        """
+        rows = {r["code"]: r for r in engine.list_stocks()}
+        self.assertTrue(rows, "库里一只都没有？这条测试已经失去意义")
+        for code, row in rows.items():
+            with self.subTest(code=code):
+                self.assertIn("is_pig_company", row,
+                              "每一行都要有这一格（不是也是值，不是缺键）")
+                self.assertEqual(
+                    row["is_pig_company"],
+                    pig_core.is_pig_company(code, row.get("industry")))
+        marked = {c for c, r in rows.items() if r["is_pig_company"]}
+        self.assertTrue(marked & self._members_present(set(rows)),
+                        "对照组里在库的成员一个都没标上？")
+        if NON_PIG in rows:
+            detail = engine.get_stock(NON_PIG)
+            self.assertEqual(detail["is_pig_company"],
+                             pig_core.is_pig_company(NON_PIG,
+                                                     detail.get("industry")))
+            self.assertFalse(detail["is_pig_company"])
 
 
 class TestFrontendContract(unittest.TestCase):

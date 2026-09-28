@@ -91,6 +91,13 @@ UNWIRED_METRIC = "*"
 # * ``pig_industry_series`` 是**事实**（某个日期、某个地区、某个口径 = 某个数），
 #   主键是 ``series_hash``——同一份事实重复抓取不写第二行，「值被上游改了」才
 #   写新行（append-only 的同一套道理，见 ``pig_observations``）。
+#
+#   批 6 修正：``series_hash`` 以前把 ``raw_response_hash``（整窗响应体的 sha256）
+#   和 ``url``（带 sDate/eDate 的完整 URL）也算进身份，于是「同一份事实被两次不同
+#   窗口的抓取各回了一次」会得到两个哈希、写两行——实测 2026-09-01…09-26 每天 2 行
+#   共 156 组，值全都相同（0 条真实修订）。**抓取身份不是事实身份。** 现在身份只有
+#   ``_FACT_IDENTITY_FIELDS`` 那几项，溯源（``raw_response_hash``/``source_url``/
+#   ``request_params``）仍旧留在列里，但不参与身份。
 # * ``pig_industry_series_meta`` 是**台账**（第几次请求、请求参数、原始响应指纹、
 #   拿到几行、成没成、为什么没成）。它记的是「我们做过什么」，不是「世界是什么」。
 #
@@ -117,7 +124,9 @@ CREATE TABLE IF NOT EXISTS pig_industry_series (
     reason TEXT,
     note TEXT,
     fetched_at TEXT NOT NULL,
-    first_seen_at TEXT NOT NULL
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT,
+    revision_count INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_pig_series_metric
     ON pig_industry_series (metric_id, metric_variant, region, period);
@@ -148,7 +157,25 @@ COLUMNS = ("series_hash", "metric_id", "metric_variant", "region", "period",
            "value", "unit", "scope", "source_level", "source_type",
            "source_name", "source_url", "request_params", "raw_response_hash",
            "publication_date", "status", "reason", "note", "fetched_at",
-           "first_seen_at")
+           "first_seen_at", "last_seen_at", "revision_count")
+
+#: ``series_hash`` 的身份来源。**只放事实，不放抓取**：
+#:
+#: * 事实：metric / variant / region / period / value / unit / source_level
+#: * 来源是谁（``source_type`` + ``source_name`` —— ``source_name`` 是 provider 的稳定
+#:   标签，**不是**请求 URL）：同一个数由两个不同来源给出，是**两条证据**，该各留一行；
+#:   同一个来源用两个窗口抓同一个数，是**同一条事实**，只该留一行。
+#:
+#: ``value`` 在身份里，所以「上游把值改了」= 新哈希 = 新行 = 一次真实修订，旧行一字不动。
+#: **不要**把 ``fetched_at`` / ``first_seen_at`` / ``last_seen_at`` / ``raw_response_hash``
+#: / ``source_url`` / ``request_params`` 加回来——前三个是时间、后三个是抓取身份，
+#: 任何一个加回来都会让「重复抓取」重新分裂成两条事实。
+_FACT_IDENTITY_FIELDS = ("metric_id", "metric_variant", "region", "period", "value",
+                         "unit", "source_level", "source_type", "source_name")
+
+#: 去掉 ``value`` 之后的「事实键」。同一个事实键的不同 ``value`` = 同一个事实的多个版本，
+#: ``revision_count`` 就记这个键下有多少个版本。
+_FACT_KEY_FIELDS = tuple(f for f in _FACT_IDENTITY_FIELDS if f != "value")
 
 #: 台账表的写入列。**与建表列一一对应**，漏一列就会撞 NOT NULL——
 #: 这类错误必须在第一次写入时就炸出来，而不是静默写一行缺了 ``metric_id`` 的台账。
@@ -160,6 +187,20 @@ META_COLUMNS = ("request_key", "provider", "metric_id", "metric_variant",
 
 def ensure_schema(conn):
     conn.executescript(SCHEMA)
+    # 批 6 新增的两列。``CREATE TABLE IF NOT EXISTS`` 对**已存在**的表一个字都不改，
+    # 所以老库必须靠 ALTER 补——按列名探测，幂等，跑几次都一样。
+    #
+    # 这里**只加列、不动数据**：老行的 ``last_seen_at`` 是 NULL，读侧对此是无所谓的
+    # （``monthly_average`` 的择优键首选 ``fetched_at``，``_write_points`` 的
+    # ``last_seen_at IS NULL`` 分支也认它）。回填放在
+    # ``pig_series_repair.apply`` 里做——``ensure_schema`` 是**读路径**会调的，
+    # 让它顺手全表 UPDATE 一下，「dry-run 不写库」就成了假话。
+    have = {row[1] for row in conn.execute("PRAGMA table_info(pig_industry_series)")}
+    for col, ddl in (("last_seen_at", "ADD COLUMN last_seen_at TEXT"),
+                     ("revision_count",
+                      "ADD COLUMN revision_count INTEGER NOT NULL DEFAULT 1")):
+        if col not in have:
+            conn.execute("ALTER TABLE pig_industry_series " + ddl)
     conn.commit()
 
 
@@ -262,15 +303,20 @@ class PigIndustryDataProvider:
     def _point(self, metric_id, variant, value, unit, period, env, *, region=None,
                status=STATUS_OK, reason=None, note=None, scope=None,
                publication_date=None):
-        """一条序列点。**指纹进 ``raw_response_hash``，请求参数进 ``request_params``**
-        ——「这个价是哪次响应的哪一段」必须能一路查回去。"""
+        """一条序列点。**溯源进 ``raw_response_hash`` / ``source_url`` /
+        ``request_params``**——「这个价是哪次响应的哪一段」必须能一路查回去。
+
+        但 ``series_hash`` **只认事实**（见 ``_FACT_IDENTITY_FIELDS``）：窗口边界
+        飘了、响应体变了，只要还是同一个来源的同一个数，哈希就不变。"""
         params = env.get("params") or {}
         fetched_at = env.get("fetched_at") or _now()
         payload = {"metric_id": metric_id, "metric_variant": variant,
                    "region": region, "period": period, "value": value,
                    "unit": unit, "source_level": self.source_level,
-                   "raw_response_hash": env.get("raw_sha256"),
-                   "url": env.get("url")}
+                   "source_type": self.source_type, "source_name": self.label}
+        assert set(payload) == set(_FACT_IDENTITY_FIELDS), (
+            "身份字段与 _FACT_IDENTITY_FIELDS 对不上：%s"
+            % sorted(set(payload) ^ set(_FACT_IDENTITY_FIELDS)))
         return {
             "series_hash": _digest(payload),
             "metric_id": metric_id, "metric_variant": variant, "region": region,
@@ -283,6 +329,9 @@ class PigIndustryDataProvider:
             "publication_date": publication_date, "status": status,
             "reason": reason, "note": note, "fetched_at": fetched_at,
             "first_seen_at": fetched_at,
+            # 第一次写入时它只被见过一次，所以 last_seen_at == fetched_at、revision_count == 1。
+            # 后面再见到同一个数，_write_points 只推 last_seen_at，不新增行。
+            "last_seen_at": fetched_at, "revision_count": 1,
         }
 
     def _entry(self, env, metric_id, variant, *, region=None, rows=0,
@@ -339,8 +388,8 @@ class Yangzhu360Provider(PigIndustryDataProvider):
     不得标成官方（``source_level = L6``）。
 
     单位**抄来源自己的页面**（来源每个面板都写着自己的单位），不是我们默认
-    元/公斤：生猪 / 仔猪 / 白条 = 元/公斤，玉米 / 豆粕 = 元/吨。本批只取前三个
-    （它们才是猪价口径）。
+    元/公斤：生猪 / 仔猪 / 白条 = 元/公斤，玉米 / 豆粕 = 元/吨。批 9 起
+    **只取生猪价格**（见 :attr:`series_types`）——仔猪价与白条价停抓。
     """
 
     name = "yangzhu360"
@@ -349,10 +398,17 @@ class Yangzhu360Provider(PigIndustryDataProvider):
     label = "猪好多数据（商业数据源，外三元口径）"
 
     #: ``metric_id → (variant, 源侧 type)``
+    #:
+    #: **批 9 起只抓生猪价格一项。** 用户裁定「有用的只有生猪价格」，
+    #: 仔猪价与白条价不再需要。两者**都没有任何 factor 消费**（不在
+    #: ``FACTOR_METRICS`` 里），此前纯粹是抓回来铺在页面上——实测它们占了
+    #: ``pig_industry_series`` 全部 3817 行里的 2524 行（66%）。
+    #: **这里只是停抓，不是删数据**：已经抓到的历史一行不动（用户长期指令
+    #: 第 10 条），只是不再新增、也不再进主视区。
+    #: ``national_pig_price`` 保留——它在评分体系里有正式位置
+    #: （``pig_product_price`` / ``sale_price_level``）。
     series_types = {
         _pig.M_NATIONAL_PIG_PRICE: ("national_avg_price", "pigprice"),
-        _pig.M_PIGLET_PRICE: ("national_avg_price", "piglet"),
-        _pig.M_WHITE_MEAT_PRICE: ("national_wholesale_price", "white_meat"),
     }
 
     #: 地区序列：``adcode → 省名``。**逐条列出而不是全量循环**——每多一个地区就
@@ -648,8 +704,22 @@ def ingest(conn, *, start, end, providers_chain=None, regions=None, sleep=0.2,
     return report
 
 
+def _fact_key_of(point):
+    """同一个事实键 = 身份去掉 ``value``。用来数「这个事实有过几个版本」。"""
+    return _digest({f: point.get(f) for f in _FACT_KEY_FIELDS})
+
+
 def _write_points(conn, points):
-    """append-only 写序列点。已有的 ``series_hash`` **只刷新 fetched_at**。"""
+    """append-only 写序列点。
+
+    冲突（``series_hash`` 已存在）**只推进 ``last_seen_at``**：哈希里含 ``value``，
+    所以命中同一个哈希就意味着**值一模一样**——那是一次重新确认，不是新事实、不是新修订。
+    ``fetched_at`` / ``first_seen_at`` 保持第一次写入时的值（要「最后见到」看 ``last_seen_at``）。
+
+    同一个事实键下**值变了** → 哈希不同 → 正常 INSERT 一行新版本，旧行一字不动；
+    该事实键下所有行的 ``revision_count`` 一起改成当前版本数。
+    返回新增的行数（重新确认不算）。
+    """
     if not points:
         return 0
     hashes = sorted({p["series_hash"] for p in points})
@@ -660,16 +730,45 @@ def _write_points(conn, points):
         known.update(row[0] for row in conn.execute(
             "SELECT series_hash FROM pig_industry_series"
             " WHERE series_hash IN (%s)" % marks, chunk))
+    # 各事实键已有的版本数（新行接着往下编号）。整表一次算完，避免逐点查库。
+    # 事实键是摘要、不是列，所以自己按 ``_FACT_KEY_FIELDS`` 的分组算一遍。
+    versions = {}
+    for row in conn.execute(
+            "SELECT %s, MAX(revision_count) FROM pig_industry_series GROUP BY %s"
+            % (", ".join(_FACT_KEY_FIELDS), ", ".join(_FACT_KEY_FIELDS))):
+        versions[_digest(dict(zip(_FACT_KEY_FIELDS, row[:-1])))] = int(row[-1] or 1)
     sql = "INSERT INTO pig_industry_series (%s) VALUES (%s)" % (
         ", ".join(COLUMNS), ", ".join("?" for _ in COLUMNS))
     fresh = 0
+    fresh_keys = {}
     for point in points:
         if point["series_hash"] not in known:
             fresh += 1
             known.add(point["series_hash"])
-        conn.execute(sql + " ON CONFLICT(series_hash) DO UPDATE"
-                          " SET fetched_at=excluded.fetched_at",
-                     tuple(point.get(c) for c in COLUMNS))
+            key = _fact_key_of(point)
+            seen = versions.get(key, 0) + 1
+            versions[key] = seen
+            fresh_keys[key] = point                  # 同一个键只留最后一个代表
+            row = dict(point)
+            row["revision_count"] = seen
+            conn.execute(sql, tuple(row.get(c) for c in COLUMNS))
+        else:
+            # 同一个哈希 = 同一个值，就是同一条事实：只推进 last_seen_at。
+            # 条件里的比较保证时间只前进、不后退（乱序补抓不会把时间戳拉回去）。
+            conn.execute(
+                "UPDATE pig_industry_series SET last_seen_at = ?"
+                " WHERE series_hash = ? AND (last_seen_at IS NULL OR last_seen_at < ?)",
+                (point["last_seen_at"], point["series_hash"],
+                 point["last_seen_at"]))
+    # 事实键下所有行（含旧版本）的 revision_count 对齐到当前版本数，这样从任意一行
+    # 都能读出「这个事实一共被改过几次」。键是摘要不是列，所以按它的组成列匹配；
+    # 用 ``IS`` 而不是 ``=``，因为 ``region`` 可为 NULL（全国点的 region 就是 None）。
+    where = " AND ".join("%s IS ?" % f for f in _FACT_KEY_FIELDS)
+    for key, point in fresh_keys.items():
+        if versions.get(key, 1) > 1:
+            conn.execute(
+                "UPDATE pig_industry_series SET revision_count = ? WHERE " + where,
+                (versions[key],) + tuple(point.get(f) for f in _FACT_KEY_FIELDS))
     return fresh
 
 
@@ -751,9 +850,10 @@ def latest(conn, metric_id, *, variant=None, region=None, as_of=None):
                                  r["series_hash"]))
     best = dict(same_day[0])
     best["sources"] = sorted({r["source_name"] for r in same_day})
-    # 同一天有多行是**正常的**：同一个来源的两条取数路径（逐省时间序列与地图
-    # 横截面）会各回一个当天的值。值相同 → 同一份事实的两次观察，无害；值不同
-    # → **不许静默挑一个**（用户裁定）。这里只把事实摆出来并置 ``conflict``，
+    # 同一天仍可能有多行，但**只剩一种情形**：同一个来源的两条取数路径（逐省
+    # 时间序列与地图横截面）对同一天回了**两个不同的值**。批 6 起 ``series_hash``
+    # 不认抓取身份，所以值相同的两条路径已经合并成一行了（以前它们会各留一行）。
+    # 值不同 → **不许静默挑一个**（用户裁定）。这里只把事实摆出来并置 ``conflict``，
     # 由消费方降 confidence，而不是由本函数替它做决定。
     values = sorted({r["value"] for r in same_day if r["value"] is not None})
     best["values"] = values
@@ -904,8 +1004,7 @@ def _cli(argv):
         print(describe(conn))
         print(json.dumps(summary(conn), ensure_ascii=False, indent=2,
                          default=str))
-        for metric_id in (_pig.M_NATIONAL_PIG_PRICE, _pig.M_PIGLET_PRICE,
-                          _pig.M_WHITE_MEAT_PRICE):
+        for metric_id in (_pig.M_NATIONAL_PIG_PRICE,):
             print(metric_id, "->", json.dumps(yoy_mom(conn, metric_id),
                                               ensure_ascii=False, default=str))
     return 0

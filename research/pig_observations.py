@@ -57,6 +57,12 @@ SOURCE_LEVELS = (
      "年报 / 中报 / 季报（定期报告，含审计附注）"),
     ("L2", _pig.SRC_MONTHLY_BULLETIN,
      "公司公告：月度经营简报 / 销售简报（未经审计，但最及时）"),
+    # 批 8：人工确认（用户录入）。**刻意排在 L2 之后**——定期报告与月报的自动值
+    # 仍然优先，人工值保留在冲突清单里（用户裁定：「MANUAL_VERIFIED 可以优先于
+    # 低置信度自动抽取，但 competing observation 必须保留」）。它不是披露值：
+    # 出处非必填，所以 ``is_direct_disclosure`` 一律 False（见 pig_core.py）。
+    ("LM", _pig.SRC_MANUAL,
+     "人工确认（用户录入 · 未做披露级校验，一律不作披露值）"),
     ("L3", _pig.SRC_EARNINGS_BRIEFING,
      "业绩说明会 / 投资者交流会议记录"),
     ("L4", _pig.SRC_INVESTOR_RELATIONS,
@@ -161,6 +167,8 @@ CREATE TABLE IF NOT EXISTS pig_metric_observation (
     benchmark_type TEXT,                 -- 溢价类观测必须写清比的是谁（§二十六）
     is_direct_disclosure INTEGER NOT NULL DEFAULT 0,
     is_estimated INTEGER NOT NULL DEFAULT 0,
+    is_approximate INTEGER NOT NULL DEFAULT 0,  -- 「约 12 元/kg」这类近似披露
+    extraction_confidence REAL,                  -- 本次抽取有多确定（≠ pig_readings.confidence）
     status TEXT NOT NULL,
     reason TEXT,
     lower_bound REAL,
@@ -181,7 +189,8 @@ COLUMNS = (
     "region", "period", "value", "unit", "scope", "source_level", "source_type",
     "source_name", "source_url", "document", "paragraph", "page",
     "publication_date", "extraction_method", "derivation", "benchmark_type",
-    "is_direct_disclosure", "is_estimated", "status", "reason", "lower_bound",
+    "is_direct_disclosure", "is_estimated", "is_approximate",
+    "extraction_confidence", "status", "reason", "lower_bound",
     "upper_bound", "conflict_group_id", "fetched_at", "first_seen_at",
 )
 
@@ -191,7 +200,7 @@ EXTRACTION_METHODS = (
     "local_parse",        # 本地缓存 PDF/表格解析
     "api",                # 结构化接口（猪好多 / 交易所接口）
     "official_page",      # 官方网页（农业农村部等）
-    "manual_entry",       # 人工录入（**必须带文档出处**，见 check_errors）
+    "manual_entry",       # 人工录入（批 8 起是**官方入口**，出处非必填；见 check_errors）
 )
 
 #: 溢价类指标：观测必须写清 ``benchmark_type``（比的是全国均价、官方地区价、
@@ -254,6 +263,7 @@ class Observation:
                  paragraph=None, page=None, publication_date=None,
                  extraction_method="local_parse", derivation=None,
                  benchmark_type=None, is_direct_disclosure=False, is_estimated=False,
+                 is_approximate=False, extraction_confidence=None,
                  status=STATUS_MISSING, reason=None, lower_bound=None,
                  upper_bound=None, fetched_at=None, first_seen_at=None,
                  source_level=None):
@@ -290,6 +300,11 @@ class Observation:
         self.is_direct_disclosure = bool(is_direct_disclosure)
         # 推算级别一定是估计值（与 pig.PigMetricRecord 同一条强制规则）。
         self.is_estimated = bool(is_estimated or level in ESTIMATED_LEVELS)
+        # 「公司自己说这是约数」与「我们猜的」是两件事：前者是披露的**属性**
+        # （原文写着「约」），后者是来源级别。合成一个标志会让「牧原说约 12」
+        # 与「我们从分部表倒推 12」在载荷上长得一样。
+        self.is_approximate = bool(is_approximate)
+        self.extraction_confidence = _num(extraction_confidence)
         self.status = status
         self.reason = reason
         self.lower_bound = _num(lower_bound)
@@ -324,6 +339,10 @@ class Observation:
             "page": self.page,
             "publication_date": self.publication_date,
             "derivation": self.derivation,
+            # 「约 12 元/kg」与「12 元/kg」是**两次不同的披露**（原文就不一样），
+            # 不覆盖它，先抽到的那条会把后抽到的那条静默去重掉——而差的那一点
+            # 恰恰是「这个数有多硬」。
+            "approx": self.is_approximate,
         })
 
     # ---- 判据 ---------------------------------------------------------- #
@@ -351,6 +370,7 @@ class Observation:
         out = {name: getattr(self, name) for name in COLUMNS}
         out["is_direct_disclosure"] = bool(self.is_direct_disclosure)
         out["is_estimated"] = bool(self.is_estimated)
+        out["is_approximate"] = bool(self.is_approximate)
         out["level_label"] = LABEL_BY_LEVEL.get(self.source_level)
         out["status_label"] = STATUS_LABELS.get(self.status)
         return out
@@ -364,14 +384,24 @@ class Observation:
 def check_errors(observations):
     """逐条自检，返回 ``[(observation_hash, 问题), ...]``。空列表 = 全部自洽。
 
-    四条硬规则，都是「不报错但会给出错答案」的那一类：
+    五条硬规则，都是「不报错但会给出错答案」的那一类。**规则条数仍是五条**——
+    批 8 改的是第 4 条的**内容**（从「必须有文档出处」改成下面那三件更准的事），
+    不是加了一条：把一个条件换成三个条件，规则数不变。
 
     1. 推算（L7）必须有 ``derivation``——「这个数怎么算出来的」是它唯一的
        可审计性来源，没有它，一个推算值和披露值在载荷上长得一样；
     2. 直接披露（``is_direct_disclosure``）不许是 L7——推算出来的数不是披露值；
     3. 溢价类指标的 ``benchmark_type`` 必须有值且在册；
-    4. 人工录入必须有文档出处（``document`` 或 ``source_url``）——「手填」
-       在用户那里是被明令禁止的，唯一允许的入口是带出处的补录。
+    4. 人工录入必须**可识别为人工**（``source_type`` 是 ``SRC_MANUAL``）且**有
+       期间**——批 8 起用户新建了官方的人工补录入口（``research/pig_core.py``），
+       所以「手填」不再是违规操作，出处也不再是必填项（用户裁定：来源不是强制项）。
+       但**不许假装有出处**：出处可以是「没填」这件事本身，来源声明
+       （``document`` / ``source_url`` / ``source_name``）至少得有一个。
+       没有期间的数会被摊到某一期上，那是「一个看起来完全正常的数」的来源之一，
+       所以期间在这一条里是硬的。
+    5. 标了近似（``is_approximate``）就必须降 ``extraction_confidence``——两条
+       必填项是**配对**的，只填一条会让「近似」在下游被当成硬数字用。这是
+       「配置漏写」而不是「数据缺失」，所以它该报出来而不是补个默认值。
     """
     bad = []
     for obs in observations or ():
@@ -387,10 +417,26 @@ def check_errors(observations):
                 bad.append((obs.observation_hash,
                             "%s 缺 benchmark_type（收到 %r）" % (
                                 obs.metric_id, obs.benchmark_type)))
-        if obs.extraction_method == "manual_entry" and not (
-                obs.document or obs.source_url):
+        if obs.extraction_method == "manual_entry":
+            if obs.source_type != _pig.SRC_MANUAL:
+                bad.append((obs.observation_hash,
+                            "%s 是人工录入，但来源类型是 %r 而不是人工确认"
+                            % (obs.metric_id, obs.source_type)))
+            if not (obs.document or obs.source_url or obs.source_name):
+                bad.append((obs.observation_hash,
+                            "%s 是人工录入，却没有来源声明"
+                            "（出处可以没有，但「没有出处」要说出来）"
+                            % obs.metric_id))
+            if not (obs.period or "").strip():
+                bad.append((obs.observation_hash,
+                            "%s 是人工录入但没有期间——没有期间的数会被摊到"
+                            "某一期上" % obs.metric_id))
+        if obs.is_approximate and not (
+                obs.extraction_confidence is not None
+                and obs.extraction_confidence < 1.0):
             bad.append((obs.observation_hash,
-                        "%s 是人工录入但没有文档出处" % obs.metric_id))
+                        "%s 标了近似值，但 extraction_confidence=%r 没降下来" % (
+                            obs.metric_id, obs.extraction_confidence)))
     return bad
 
 
@@ -403,6 +449,22 @@ _CHUNK = 900
 
 def ensure_schema(conn):
     conn.executescript(SCHEMA)
+    # 批 7 新增的两列。``CREATE TABLE IF NOT EXISTS`` 对**已存在**的表一个字都不改，
+    # 所以老库必须靠 ALTER 补——按列名探测，幂等，跑几次都一样（照
+    # ``pig_industry_series.ensure_schema`` 的既有模式）。
+    #
+    # **只加列、不回填**：老库里一行近似值都没有（``is_approximate`` 是批 7 才
+    # 有的概念），所以 DEFAULT 0 就是真值，不需要 UPDATE。回填要做也得放进
+    # ``pig_cost_core --apply`` 里——``ensure_schema`` 是**读路径**会调的
+    # （``load`` 第一行就是它），让它顺手写一笔，「dry-run 不写库」就成了假话。
+    have = {row[1] for row in conn.execute(
+        "PRAGMA table_info(pig_metric_observation)")}
+    for col, ddl in (("is_approximate",
+                      "ADD COLUMN is_approximate INTEGER NOT NULL DEFAULT 0"),
+                     ("extraction_confidence",
+                      "ADD COLUMN extraction_confidence REAL")):
+        if col not in have:
+            conn.execute("ALTER TABLE pig_metric_observation " + ddl)
     conn.commit()
 
 
@@ -493,6 +555,7 @@ def load(conn, *, code=None, metric_id=None, region=None, subject=None):
         data.pop("conflict_group_id", None)
         data["is_direct_disclosure"] = bool(data.get("is_direct_disclosure"))
         data["is_estimated"] = bool(data.get("is_estimated"))
+        data["is_approximate"] = bool(data.get("is_approximate"))
         data["source_type"] = data.get("source_type")
         data["source_level"] = data.get("source_level")
         data["subject"] = data.get("subject") or (data.get("company_code") or "industry")
@@ -508,7 +571,10 @@ def load(conn, *, code=None, metric_id=None, region=None, subject=None):
             extraction_method=data.get("extraction_method") or "local_parse",
             derivation=data.get("derivation"), benchmark_type=data.get("benchmark_type"),
             is_direct_disclosure=data.get("is_direct_disclosure"),
-            is_estimated=data.get("is_estimated"), status=data.get("status") or STATUS_MISSING,
+            is_estimated=data.get("is_estimated"),
+            is_approximate=data.get("is_approximate"),
+            extraction_confidence=data.get("extraction_confidence"),
+            status=data.get("status") or STATUS_MISSING,
             reason=data.get("reason"), lower_bound=data.get("lower_bound"),
             upper_bound=data.get("upper_bound"), fetched_at=data.get("fetched_at"),
             first_seen_at=data.get("first_seen_at")))
@@ -588,7 +654,8 @@ def conflicts(observations):
 _PREFERRED_FIELDS = ("status", "value", "lower_bound", "upper_bound", "unit",
                      "period", "scope", "source_level", "source_name", "source_url",
                      "document", "page", "publication_date", "is_estimated",
-                     "is_direct_disclosure", "derivation", "benchmark_type", "reason",
+                     "is_direct_disclosure", "is_approximate",
+                     "extraction_confidence", "derivation", "benchmark_type", "reason",
                      "observation_hash")
 
 #: 一个口径组**没有可用值**时，报哪一条的状态。
@@ -661,6 +728,8 @@ def preferred(observations):
                 publication_date=best.publication_date,
                 is_estimated=best.is_estimated,
                 is_direct_disclosure=best.is_direct_disclosure,
+                is_approximate=best.is_approximate,
+                extraction_confidence=best.extraction_confidence,
                 derivation=best.derivation, benchmark_type=best.benchmark_type,
                 observation_hash=best.observation_hash, observations=len(rows))
             continue
@@ -690,6 +759,8 @@ def preferred(observations):
             publication_date=winner.publication_date,
             is_estimated=winner.is_estimated,
             is_direct_disclosure=winner.is_direct_disclosure,
+            is_approximate=winner.is_approximate,
+            extraction_confidence=winner.extraction_confidence,
             derivation=winner.derivation, benchmark_type=winner.benchmark_type,
             reason=_merged_reason(winner, lower),
             lower_conflicts=[r.to_dict() for r in lower],

@@ -165,7 +165,9 @@ class TestDirectionConsistency(unittest.TestCase):
         "anchor_confidence": F.DIRECTION_HIGHER_BETTER,
         # ---- 批 4 新增：猪产业专属（本批只建骨架）----
         # 暴露与单价是**状态描述**（暴露高不等于好，见 spec 的 role_reason）；
-        # 完全成本降、单位毛利升、成本优势、售价溢价、出栏、产能才是好坏。
+        # 完全成本降、单位毛利升、成本优势、出栏、产能才是好坏。
+        # 批 9 之后这里没有 ``price_premium``：那一格因子已摘（用户裁定不要
+        # 区域溢价），所以它连方向声明都不该再出现在这张表里。
         # PSY / MSY 判不出单调好坏（成活率口径，见 spec 的 note），所以是中性。
         "pig_exposure": F.DIRECTION_NEUTRAL,
         "pig_product_price": F.DIRECTION_NEUTRAL,
@@ -173,7 +175,6 @@ class TestDirectionConsistency(unittest.TestCase):
         "full_cost": F.DIRECTION_LOWER_BETTER,
         "unit_margin": F.DIRECTION_HIGHER_BETTER,
         "cost_advantage": F.DIRECTION_HIGHER_BETTER,
-        "price_premium": F.DIRECTION_HIGHER_BETTER,
         "output_volume": F.DIRECTION_HIGHER_BETTER,
         "effective_capacity": F.DIRECTION_HIGHER_BETTER,
         "utilization": F.DIRECTION_NEUTRAL,
@@ -188,7 +189,7 @@ class TestDirectionConsistency(unittest.TestCase):
         # （其余 7 条水位读数——完全成本 / 单位毛利 / 出栏 / 产能等——是**原始
         # 读数**，不是组成因子，它们的方向在上面的批 4 段里已经声明过。）
         "margin_position": F.DIRECTION_LOWER_BETTER,
-        "price_position": F.DIRECTION_LOWER_BETTER,
+        "sale_price_level": F.DIRECTION_LOWER_BETTER,
         "supply_contraction": F.DIRECTION_HIGHER_BETTER,
         "capacity_delivery": F.DIRECTION_HIGHER_BETTER,
         "financial_survivability": F.DIRECTION_HIGHER_BETTER,
@@ -1916,7 +1917,7 @@ class TestRunLabelsTravelFromAnalyze(unittest.TestCase):
         seen = {}
 
         def fake_persist(conn, code, quote, m, result, period, industry, refreshed,
-                         note=None, baseline_tag=None):
+                         note=None, baseline_tag=None, mode=None):
             seen["note"] = note
             seen["baseline_tag"] = baseline_tag
 
@@ -2255,14 +2256,24 @@ class TestPigIndustryGroup(unittest.TestCase):
     """批 5：猪企组的组内权重 + 因子级门（§三十七–§三十九）。"""
 
     def test_group_weights_are_configuration_not_literals(self):
-        """7 个组成因子的权重全部从 ``GROUP_FACTOR_WEIGHTS`` 读，且和为 1.00。"""
+        """5 个组成因子的权重全部从 ``GROUP_FACTOR_WEIGHTS`` 读，且和为 1.00。
+
+        批 9 摘掉 ``price_premium``（原 0.10）之后，剩下五格按**原比例**放大
+        （各自 ÷0.90 = 5:3:4:3:3 份）。这里断言的是**归一的结果**，不是
+        「重新拍过的五个整数」——所以写成分数而不是小数：``5/18`` 一眼能看出
+        它来自 ``0.25/0.90``，写成 ``0.2778`` 就看不出这层关系了。
+        """
         table = D.GROUP_FACTOR_WEIGHTS[F.GROUP_PIG_INDUSTRY]
-        for fid, want in (("margin_position", 0.25), ("price_position", 0.15),
-                          ("supply_contraction", 0.20), ("cost_advantage", 0.15),
-                          ("capacity_delivery", 0.15), ("price_premium", 0.10)):
-            self.assertAlmostEqual(table[fid], want, places=4, msg=fid)
+        for fid, want in (("margin_position", 0.25 / 0.90),
+                          ("sale_price_level", 0.15 / 0.90),
+                          ("supply_contraction", 0.20 / 0.90),
+                          ("cost_advantage", 0.15 / 0.90),
+                          ("capacity_delivery", 0.15 / 0.90)):
+            self.assertAlmostEqual(table[fid], want, places=6, msg=fid)
+        self.assertNotIn("price_premium", table,
+                         "批 9 已摘掉这一格；它回来了就必须在这里重新配权并归一")
         self.assertAlmostEqual(sum(table.values()), 1.0, places=6,
-                               msg="正权重六格加起来必须是 1.00")
+                               msg="正权重五格加起来必须是 1.00")
         self.assertEqual(D.group_factor_weight_errors(), [])
 
     def test_the_zero_weight_members_are_score_factors_not_applicability_ones(self):

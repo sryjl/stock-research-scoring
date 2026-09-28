@@ -161,9 +161,15 @@ class AuditGateTestCase(unittest.TestCase):
             " audit_ok_at FROM research_stocks WHERE code=?", (code,)).fetchone())
 
     def _analyze(self, code):
-        """走生产路径，只把行情换成假的——门禁路径本来就只有这一次外部请求。"""
+        """走生产路径，只把行情换成假的——门禁路径本来就只有这一次外部请求。
+
+        **显式 MODE_PERSIST**：批 6 起 ``analyze`` 默认 DRY_RUN（不落库）。本组
+        测的正是「生产调用会写什么」——门禁落行、标 RUNNING、清状态——所以要照
+        生产入口那样显式开口。默认 DRY_RUN 那条路径由 tests/test_engine_modes.py
+        单独钉住。
+        """
         with mock.patch.object(engine, "get_provider", FakeProvider):
-            return engine.analyze(code)
+            return engine.analyze(code, mode=engine.MODE_PERSIST)
 
     def _listed(self, code):
         return next(r for r in engine.list_stocks() if r["code"] == code)

@@ -16,6 +16,8 @@ import json
 import sqlite3
 import sys
 import unittest
+from hashlib import sha256
+from urllib.parse import urlencode
 
 from research import pig_industry_series as PIS
 from research import providers
@@ -68,13 +70,28 @@ class FakeProvider(PIS.Yangzhu360Provider):
     def endpoint(self):
         return "https://example.test/line"
 
-    def _env(self):
-        return {"url": self.endpoint(), "params": {"type": "pigprice"},
-                "fetched_at": self.fetched_at, "raw_sha256": "f" * 64,
+    def _env(self, start=None, end=None):
+        """**窗口进 ``url`` 和 ``raw_sha256``**，照 ``providers._fetch_json`` 的真实行为
+        （它把 ``sDate``/``eDate`` 拼进 query，而对整窗响应体取 sha256）。
+
+        批 6 之前这里把 ``raw_sha256`` 写死成 ``"f" * 64``，于是「两次不同窗口抓同一个数」
+        在夹具里长得和「两次同窗口抓同一个数」一模一样——``test_refetch_only_touches_fetched_at``
+        断言的契约是对的，夹具却把 bug 盖住了，26 条测试全绿而库里那 156 组重复照样在。
+        **夹具必须和真实响应一样会变**，否则它测的是自己的常数。
+        """
+        params = {"type": "pigprice"}
+        url = self.endpoint()
+        if start is not None and end is not None:
+            params.update({"sDate": start, "eDate": end})
+            url = "%s?%s" % (url, urlencode(params))
+        return {"url": url, "params": params,
+                "fetched_at": self.fetched_at,
+                "raw_sha256": sha256(
+                    ("%s|%s" % (url, self.fetched_at)).encode("utf-8")).hexdigest(),
                 "raw_bytes": 1234}
 
     def _fetch(self, start, end, regions, sleep):
-        env = self._env()
+        env = self._env(start, end)
         metric, variant = _pig.M_NATIONAL_PIG_PRICE, "national_avg_price"
         if self.fail:
             # 失败**绝不产生数据行**（用户裁定），只留台账。
@@ -248,7 +265,7 @@ class TestIngestAndLoad(unittest.TestCase):
         self.assertEqual(conn.execute(
             "SELECT COUNT(*) FROM pig_industry_series").fetchone()[0], 2)
 
-    def test_refetch_only_touches_fetched_at(self):
+    def test_refetch_only_touches_last_seen_at(self):
         conn = _conn()
         PIS.ingest(conn, start="2026-09-01", end="2026-09-15",
                    providers_chain=(FakeProvider(
@@ -263,9 +280,63 @@ class TestIngestAndLoad(unittest.TestCase):
         rows = [dict(r) for r in conn.execute(
             "SELECT * FROM pig_industry_series")]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["fetched_at"], "2026-09-27 18:00:00")
-        # 指纹不含 fetched_at：同一个数重取一次**不是**另一条序列。
+        # 同一个数重取一次**不是**另一条序列。批 6 起「最后见到」记在 last_seen_at 上，
+        # fetched_at / first_seen_at 钉死在第一次写入的时刻（它们答的是「首次见到」）。
+        self.assertEqual(rows[0]["last_seen_at"], "2026-09-27 18:00:00")
+        self.assertEqual(rows[0]["fetched_at"], "2026-09-27 10:00:00")
         self.assertEqual(rows[0]["first_seen_at"], "2026-09-27 10:00:00")
+        self.assertEqual(rows[0]["revision_count"], 1)   # 值没变过 = 只有 1 个版本
+
+    def test_a_different_window_does_not_split_the_fact(self):
+        """**批 6 的核心回归**：同一份事实、两次**不同窗口**的抓取 → 仍然只有 1 行。
+
+        这正是库里 2026-09-01…09-26 那 156 组重复的成因：``series_hash`` 以前把
+        ``raw_response_hash``（整窗响应体的 sha256）和 ``url``（带 sDate/eDate）也算进
+        身份，于是「同样的日期、同样的值」只要来自不同窗口就是两个哈希、写两行。
+        抓取身份**不是**事实身份。
+        """
+        conn = _conn()
+        first = PIS.ingest(conn, start="2026-09-01", end="2026-09-27",
+                           providers_chain=(FakeProvider(
+                               [("2026-09-15", 10.90)],
+                               fetched_at="2026-09-27 03:52:00"),),
+                           today="2026-09-27")
+        second = PIS.ingest(conn, start="2026-06-28", end="2026-09-26",
+                            providers_chain=(FakeProvider(
+                                [("2026-09-15", 10.90)],
+                                fetched_at="2026-09-27 03:56:00"),),
+                            today="2026-09-27")
+        self.assertEqual(first["new"], 1)
+        self.assertEqual(second["points"], 1)
+        self.assertEqual(second["new"], 0)          # 窗口变了，事实没变
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM pig_industry_series")]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["value"], 10.90)
+        # 溯源仍留着**首次**那次窗口，能一路查回去
+        self.assertIn("sDate=2026-09-01", rows[0]["source_url"] or "")
+
+    def test_a_changed_value_is_a_revision_not_a_second_fact(self):
+        """值被上游改了 = 真修订：写新行，旧行一字不动，两行都记着版本数。"""
+        conn = _conn()
+        PIS.ingest(conn, start="2026-09-01", end="2026-09-15",
+                   providers_chain=(FakeProvider(
+                       [("2026-09-15", 10.90)],
+                       fetched_at="2026-09-27 10:00:00"),),
+                   today="2026-09-27")
+        PIS.ingest(conn, start="2026-09-01", end="2026-09-15",
+                   providers_chain=(FakeProvider(
+                       [("2026-09-15", 11.40)],
+                       fetched_at="2026-09-27 18:00:00"),),
+                   today="2026-09-27")
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM pig_industry_series ORDER BY value")]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([r["value"] for r in rows], [10.90, 11.40])
+        # 旧值仍在，读侧据此报 conflict，不是被静默替换
+        self.assertEqual([r["revision_count"] for r in rows], [2, 2])
+        self.assertEqual(rows[0]["first_seen_at"], "2026-09-27 10:00:00")
+        self.assertEqual(rows[1]["first_seen_at"], "2026-09-27 18:00:00")
 
     def test_failure_produces_no_data_row(self):
         conn = _conn()
@@ -523,14 +594,20 @@ class TestCrossSection(unittest.TestCase):
                    regions=("440000",), sleep=0, today="2026-09-27")
         rows = [dict(r) for r in conn.execute(
             "SELECT * FROM pig_industry_series")]
-        # 三个指标各两个地区（全国 + 广东）→ 6 个点，全都在窗口那一天。
-        self.assertEqual(len(rows), 6)
+        # 批 9 起 ``series_types`` 只剩生猪价格一项 → 两个地区（全国 + 广东）
+        # 各一个点。数目与指标名都从 ``series_types`` 算出来，不抄字面量：
+        # 抄一份的话，将来再加一个指标时这条测试只会「数字对不上」，
+        # 而看不出它本来要钉的是**口径不许挂错**。
+        want_metrics = set(PIS.Yangzhu360Provider.series_types)
+        self.assertEqual(len(rows), 2 * len(want_metrics))
         self.assertEqual({r["period"] for r in rows}, {"2026-09-26"})
+        self.assertEqual({r["metric_id"] for r in rows}, want_metrics)
         by_region = {}
         for row in rows:
             by_region.setdefault(row["region"], set()).add(row["metric_variant"])
-        self.assertEqual(by_region[None], {"national_avg_price",
-                                           "national_wholesale_price"})
+        self.assertEqual(by_region[None],
+                         {PIS.Yangzhu360Provider.series_types[m][0]
+                          for m in want_metrics})
         self.assertEqual(by_region["440000"],
                          {PIS.Yangzhu360Provider.REGION_VARIANT})
 

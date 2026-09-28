@@ -65,6 +65,7 @@ M_NATIONAL_PIG_PRICE = "national_pig_price"
 M_FULL_COST = "full_cost"
 M_CASH_COST = "cash_cost"
 M_FATTENING_COST = "fattening_cost"
+M_WEANED_PIGLET_COST = "weaned_piglet_cost"   # 批 7：断奶仔猪成本，**元/头**
 M_UNIT_MARGIN = "unit_margin"
 M_COST_ADVANTAGE = "cost_advantage"
 M_REGIONAL_PREMIUM = "regional_price_premium"
@@ -122,9 +123,70 @@ BATCH_5_1_METRIC_IDS = (
     M_PIGLET_PRICE, M_WHITE_MEAT_PRICE,
 )
 
-#: 31 个指标 id。前 22 个是批 5 的用户清单（顺序照抄，也是报告里的展示顺序），
-#: 后面 9 个是批 5.1 按 spec 拆出来的口径。**拆分不是加格子**：每一格都能指出
-#: 它原本寄生在哪一格、混用会给出什么错的答案（见上面的注释）。
+#: 批 7 新增的格子。只有一格，而且它**不是**从别的格子拆出来的——是本地语料里
+#: 真的有一条披露（新希望 2025A p27：全年平均断奶成本 251 元/头）才建的
+#: （裁定 2：「只建真有数据的格子」）。
+#:
+#: 它必须单列在这里、**不能塞进上面那 22 格里**：那 22 格是用户给的清单，
+#: 顺序照抄，往里插一格就等于改了用户清单本身。所以新的批次一律接在尾部，
+#: 「前 22 格 = 批 5 清单」这条不变量才守得住（``tests/test_pig_industry.py``
+#: 钉着它）。
+BATCH_7_METRIC_IDS = (M_WEANED_PIGLET_COST,)
+
+# --------------------------------------------------------------------------- #
+# 批 8：猪企核心经营数据**收敛为三项**（用户裁定）
+#
+# 这一节是**做减法**的落点：三项之外的口径不再进核心流程。核心关系只有两条——
+# ``单位利润 = 销售均价 − 完全成本``、``盈利能力 ≈ 单位利润 × 出栏规模``——
+# 所以只留这三格。**收敛不是删除**：既有格子的 MetricDef、抽取逻辑、观测、证据
+# 一律原样保留（见 §二：不删库、不删抽取、可继续作 evidence 存在）。
+#
+# 三个 id **都是既有格子**，一个都没有重命名、没有新建：`pig_sale_price` 早在
+# 批 5 就有，`full_cost` 亦然，`hog_sales_volume` 亦然。批 8 只是**说出来**
+# 「这三个是核心、其余不是」，并把这句话写进代码（于是可测、可审计）。
+# --------------------------------------------------------------------------- #
+#: 三项核心经营数据的 metric_id。顺序即界面顺序。
+#:
+#: **第三项是商品猪口径，不是生猪合计**（批 9 用户裁定「我们只管商品猪即可」）。
+#: 改这一条是改**三项的定义**，所以 :data:`research.pig_core.CORE_METRICS` 必须
+#: 同批改——那是同一件事的第二份写法，两边不一致就是两份真相。
+#: 合计口径的 :data:`M_HOG_SALES_VOLUME` 不删：它的观测照旧在库里，
+#: 只是不再是核心项、不再进主视区（见 :data:`DISPLAY_METRIC_IDS`）。
+#:
+#: 为什么必须换而不是并排：``单位利润 × 120kg`` 里的「每头」指的是**商品猪**，
+#: 而合计口径含仔猪与种猪（仔猪只有十几公斤）。并排摆着最容易被当成同一个数
+#: 相乘，那样算出来的总利润会平白变大——「看起来完全正常的错数」。
+CORE_PIG_METRIC_IDS = (M_PIG_SALE_PRICE, M_FULL_COST,
+                       M_COMMODITY_HOG_SALES_VOLUME)
+
+#: **主视区白名单**：只有这些格子会出现在「猪行业数据」页的读数与观测表里。
+#:
+#: 用白名单而不是黑名单，理由是方向：这套系统的既定方向是**停止扩张**，
+#: 所以「新加一格默认不显示、要显示得显式写进来」比「新加一格默认显示、
+#: 要藏得记得去拉黑」更符合意图——后者会在每次加格子时重新把页面撑大一遍。
+#:
+#: 五项恰好回答用户说的「有用的其实只有这些」：
+#: 销售均价 / 完全成本 / 商品猪出栏量（三项核心，见上）+ 生猪价格（行业对比）
+#: + 单位利润（三项派生的那一格）。其余一律仍住在库里、仍能作证据，
+#: 只是不再铺在主视区（**退役展示不是删除**，见 :data:`EXTENSION_METRIC_IDS`）。
+DISPLAY_METRIC_IDS = CORE_PIG_METRIC_IDS + (M_NATIONAL_PIG_PRICE, M_UNIT_MARGIN)
+
+#: **降级为扩展信息**的那些格子（用户点名的九项里，在册的六项）。
+#:
+#: 它们的待遇：不进核心研究卡片、不作为首次研究完整性要求、不触发人工补录、
+#: 不因 missing 报错、**不再为覆盖率加 parser**——但历史观测与证据一条不删。
+#: 「非三项即扩展」是定义本身，这里只列用户**点名**降级的那些，不穷举。
+#:
+#: 九项里另外三项（**仔猪成本 / 母猪效率 / 成活率**）在 :data:`METRICS` 里
+#: **从来没有格子**，所以这里没有它们：本批不新建格子（新建格子正是要停止的
+#: 那件事）。仔猪成本只作为 ``pig_cost_core.COST_VARIANTS`` 的一个**口径**存在
+#: （用于拒答分级），不是一格读数。
+EXTENSION_METRIC_IDS = (M_PSY, M_MSY, M_FEED_CONVERSION, M_AVERAGE_SALE_WEIGHT,
+                        M_WEANED_PIGLET_COST, M_CASH_COST)
+
+#: 32 个指标 id = 批 5 的 22 格（用户清单） + 批 5.1 的 9 格 + 批 7 的 1 格。
+#: **加格子不是加指标**：每一格都能指出它答的是哪个别的问题、混用会给出什么
+#: 错的答案（见上面的注释），答不上来就不该加。
 METRIC_IDS = (
     M_PIG_SALE_PRICE, M_NATIONAL_PIG_PRICE, M_FULL_COST, M_CASH_COST,
     M_FATTENING_COST, M_UNIT_MARGIN, M_COST_ADVANTAGE, M_REGIONAL_PREMIUM,
@@ -132,7 +194,7 @@ METRIC_IDS = (
     M_CAPACITY_UTILIZATION, M_SOW_INVENTORY, M_PIGLET_VOLUME, M_PSY, M_MSY,
     M_FEED_CONVERSION, M_PIG_REVENUE_EXPOSURE, M_PIG_PROFIT_EXPOSURE,
     M_PIG_ASSET_EXPOSURE, M_PIG_CAPEX_EXPOSURE, M_PIG_EXPOSURE_COMPOSITE,
-) + BATCH_5_1_METRIC_IDS
+) + BATCH_5_1_METRIC_IDS + BATCH_7_METRIC_IDS
 
 # --------------------------------------------------------------------------- #
 # 来源类型：**用户裁定的七级优先级**，顺序即优先级
@@ -144,15 +206,23 @@ METRIC_IDS = (
 # --------------------------------------------------------------------------- #
 SRC_ANNUAL_REPORT = "annual_or_interim_report"   # ① 年报 / 中报 / 季报
 SRC_MONTHLY_BULLETIN = "monthly_bulletin"        # ② 月度经营简报
+#: 批 8 新增：**用户人工确认**（MANUAL_VERIFIED）。
+#:
+#: 位置是刻意的：排在 L2 月报**之后**、L3 之前——定期报告与月报的自动值仍然优先，
+#: 人工值保留在冲突清单里（用户裁定：「MANUAL_VERIFIED 可以优先于低置信度自动
+#: 抽取，但 competing observation 必须保留」）。它不是「手填」：用户在本批新建了
+#: 官方的人工补录入口（`research/pig_core.py`），出处非必填，所以它**永远不是**
+#: 直接披露（`is_direct_disclosure=False`），也永远不升格 canonical。
+SRC_MANUAL = "manual_verified"                   # ②′ 人工确认（用户录入）
 SRC_EARNINGS_BRIEFING = "earnings_briefing"      # ③ 业绩说明会
 SRC_INVESTOR_RELATIONS = "investor_relations"    # ④ 投资者关系记录
 SRC_OFFICIAL_INDUSTRY = "official_industry"      # ⑤ 官方行业数据（农业农村部等）
 SRC_COMMERCIAL_DB = "commercial_database"        # ⑥ 商业数据库
 SRC_DERIVED = "derived"                          # ⑦ 推算
 
-SOURCE_PRIORITY = (SRC_ANNUAL_REPORT, SRC_MONTHLY_BULLETIN, SRC_EARNINGS_BRIEFING,
-                   SRC_INVESTOR_RELATIONS, SRC_OFFICIAL_INDUSTRY,
-                   SRC_COMMERCIAL_DB, SRC_DERIVED)
+SOURCE_PRIORITY = (SRC_ANNUAL_REPORT, SRC_MONTHLY_BULLETIN, SRC_MANUAL,
+                   SRC_EARNINGS_BRIEFING, SRC_INVESTOR_RELATIONS,
+                   SRC_OFFICIAL_INDUSTRY, SRC_COMMERCIAL_DB, SRC_DERIVED)
 
 #: 名次（小的优先）。缺来源类型按**最差**算，不是按最好。
 SOURCE_RANK = {name: rank for rank, name in enumerate(SOURCE_PRIORITY)}
@@ -197,6 +267,14 @@ SCOPE_ALL = "company_live_hog_all"            # 生猪合计（含仔猪、种�
 SCOPE_PIGLET = "company_piglet"               # 仔猪
 SCOPE_BREEDING = "company_breeding_pig"        # 种猪
 SCOPE_SLAUGHTER = "company_slaughter"          # 屠宰生猪
+#: 批 7 新增：**只含正常运营场线**的育肥口径（新希望 2025A p27 原文如此限定）。
+#:
+#: 它**不是** ``SCOPE_COMMODITY`` 的一个变体，而是一个**子集**：原文说的是
+#: 「公司正常运营场线肥猪完全成本」，把停养 / 改造中的场线排除在外。拿它去和
+#: 全口径商品猪均价做减法，得到的是一个**被限定的差**，而这个限定在数字上
+#: 看不出来。所以它单独取值，并且**硬性排除出同行中位数池**（见
+#: ``pig_cost_core`` 的 ``cost_advantage`` 判据）。
+SCOPE_FATTENING_NORMAL_LINES = "company_fattening_hog_normal_lines"
 #: 公司级的**合成**口径：暴露 composite 与派生溢价都在这一格。
 SCOPE_PIG_INDUSTRY = "company_pig_industry"
 #: 行业序列的全国口径（**没有地区**）。
@@ -368,7 +446,7 @@ class MetricDef:
         return "<MetricDef %s %r>" % (self.metric_id, self.display_name)
 
 
-#: 31 个指标的声明。``catalog_metric_id`` 指向 ``metric_catalog`` 里**已经登记**
+#: 32 个指标的声明。``catalog_metric_id`` 指向 ``metric_catalog`` 里**已经登记**
 #: 的同义中文名（如 ``pig_sale_price`` ↔ 公司销售均价）——桥只在这里声明一次，
 #: 不在别处再写一份对应关系；**有桥时显示名必须与目录逐字相同**（自检在
 #: :func:`contract_errors`）。
@@ -415,9 +493,25 @@ METRICS = (
               note="付现成本低于完全成本（折旧不付现）。拿它当完全成本会"
                    "系统性高估成本优势。"),
     MetricDef(M_FATTENING_COST, "育肥成本",
-              (("fattening_cost_per_kg", "CNY/kg", "只含育肥阶段的每公斤成本"),),
+              (("fattening_cost_per_kg", "CNY/kg", "只含育肥阶段的每公斤成本"),
+               ("fattening_full_cost_per_kg", "CNY/kg",
+                "只含育肥阶段、**且含期间费用**的每公斤完全成本（批 7 新增）")),
               None,
-              note="不含母猪与仔猪阶段的摊销。只有它是**阶段口径**的数。"),
+              note="不含母猪与仔猪阶段的摊销。只有它是**阶段口径**的数。"
+                   "批 7 加的 ``fattening_full_cost_per_kg`` 与正身 "
+                   "``fattening_cost_per_kg`` **不是一回事**：后者是阶段增量"
+                   "成本，前者含期间费用。新希望 2025A 说的「肥猪完全成本」是"
+                   "后者那个口径，所以它落在**第二个** variant 上——把它塞进"
+                   "正身，育肥增量成本就被期间费用顶掉了。"),
+    MetricDef(M_WEANED_PIGLET_COST, "断奶仔猪成本",
+              (("weaned_piglet_cost", "CNY/head",
+                "断奶时点的仔猪成本，**元/头**"),),
+              None,
+              note="**量纲是元/头而不是元/公斤**——它量的是「一头断奶仔猪养到"
+                   "断奶花掉多少钱」，与所有 ``CNY/kg`` 的成本格不同源不同量纲，"
+                   "做任何加减之前先看单位。与 ``piglet_cost`` 的分界是**断奶日**："
+                   "后者泛指断奶前的仔猪成本。本批语料里只有新希望 2025A 披露了"
+                   "这一个数。"),
     MetricDef(M_UNIT_MARGIN, "单位毛利",
               (("cny_per_kg", "CNY/kg", "销售均价 − 完全成本"),),
               "unit_margin",
@@ -436,8 +530,12 @@ METRICS = (
                 "公司销售均价 − **同期**区域市场月均价"),
                ("regional_market_deviation_pct", "%",
                 "公司销售均价 ÷ **同期**区域市场月均价 − 1")),
-              "price_premium",
-              note="溢价常来自区域与销售结构而不是品牌力，所以单独一格。"
+              None,
+              note="**批 9 起这一格没有 factor 位置了**（``catalog_metric_id`` 由 "
+                   "``price_premium`` 改成 ``None``）：用户裁定不要区域溢价，"
+                   "那一格因子整个摘掉。它现在的处境与 :data:`M_HOG_SLAUGHTER_VOLUME` "
+                   "一样——**只登记**：MetricDef、variant、观测、派生、缺口理由"
+                   "一条不删，只是不再有消费方、不再进主视区。"
                    "批 5.2 起这一格下有**三条口径**，互不顶替：正身"
                    "``peer_median_deviation``（相对同组公司中位数）本批仍缺；"
                    "后两条是**市场价基准**的派生值（元/公斤与百分比），比的是谁"
@@ -598,7 +696,9 @@ METRIC_INDEX = {m.metric_id: m for m in METRICS}
 #:   它被顶替，恰恰相反——有了这一行，后备判定才会去比 ``scope``，于是
 #:   「全国缺了就顶广东价」被**第三把锁**挡住（表里没有那条变体，它就顶不上来）。
 #: * ``regional_price_premium`` 的正身是**同组公司中位数偏离**，而库里只有区域
-#:   市场偏离。两者基准不同 → 锁住 → ``price_premium`` 继续 missing。
+#:   市场偏离。两者基准不同 → 锁住。这一行**批 9 之后仍然要留**：它锁的是
+#:   **指标自己的口径**（「比同行便宜」不许被读成「比区域市场价贵」），
+#:   与那一格还有没有 factor 消费无关——factor 摘了，指标还在册、还作证据。
 #:   本批不开发同组中位基准（计划 §十一）。
 METRIC_GRIDS = {
     (M_PIG_SALE_PRICE, "annual_commodity_price"): (SCOPE_COMMODITY, None),
@@ -623,7 +723,11 @@ FACTOR_METRICS = {
     "full_cost": (M_FULL_COST,),
     "unit_margin": (M_UNIT_MARGIN,),
     "cost_advantage": (M_COST_ADVANTAGE,),
-    "price_premium": (M_REGIONAL_PREMIUM,),
+    # 批 9 摘掉 ``price_premium``（售价溢价 = 区域溢价）：用户裁定「地区溢价
+    # 不需要了，有销售均价 + 完全成本就够」。**摘的是它在评分层的格位，
+    # 不是它的数据**——``regional_price_premium`` 的观测、派生、GAP_REASONS
+    # 一条不删，只是不再有 factor 消费它、不再进主视区。
+    # ``M_REGIONAL_PREMIUM`` 因此从「有 factor 位置的指标」变成「只登记」。
     "output_volume": (M_HOG_SALES_VOLUME,),
     "effective_capacity": (M_EFFECTIVE_CAPACITY,),
     "utilization": (M_CAPACITY_UTILIZATION,),
@@ -631,11 +735,12 @@ FACTOR_METRICS = {
     "piglet_supply_pressure": (M_PIGLET_VOLUME,),
     "psy": (M_PSY,),
     "msy": (M_MSY,),
-    # 批 5 的 7 个机会因子。**其中两个是复用**（``cost_advantage`` 批 4 就有，
-    # ``price_premium`` 就是用户清单里的 ``regional_premium``——同一个经济因素
-    # 不许声明两次，所以不新建 id）；``financial_survivability`` 见下面的空元组。
+    # 批 5 的 7 个机会因子。**其中一个是复用**（``cost_advantage`` 批 4 就有，
+    # 同一个经济因素不许声明两次，所以不新建 id）。批 9 之前这里是两个复用，
+    # 另一个是 ``price_premium``（即用户清单里的 ``regional_premium``）——
+    # 用户裁定不需要了，已摘掉（见上）。``financial_survivability`` 见空元组。
     "margin_position": (M_UNIT_MARGIN,),
-    "price_position": (M_PIG_SALE_PRICE, M_NATIONAL_PIG_PRICE),
+    "sale_price_level": (M_PIG_SALE_PRICE, M_NATIONAL_PIG_PRICE),
     "supply_contraction": (M_SOW_INVENTORY, M_PIGLET_VOLUME),
     # 产能兑现要的是**商品猪**出栏（§九）：总生猪销量里的仔猪与种猪不过肥产能，
     # 用总量算会让兑现率凭空变好。这一条是批 5.1 把总销量拆成三格之后，
@@ -654,7 +759,6 @@ FACTOR_VARIANTS = {
     "margin_position": "cny_per_kg",
     "company_sale_price": "annual_commodity_price",
     "output_volume": "annual_sales_heads",
-    "price_premium": "peer_median_deviation",
     "cost_advantage": "peer_median_deviation",
 }
 
@@ -669,8 +773,12 @@ GAP_REASONS = {
         "**不拿分部收入除以猪价推算**——那是「估算出的头数」，不是出栏量。",
     M_UNIT_MARGIN:
         "缺的是本指标的**正身口径**（cny_per_kg）：单位毛利要「销售均价 − "
-        "完全成本」，两者本批都缺。牧场实测里有**分部毛利率**，但批 5.1 起它是"
-        "**另一格**（:data:`M_PIG_SEGMENT_GROSS_MARGIN`）：一个百分比，不是每公斤"
+        "完全成本」，**同期间、同口径、同单位**六项条件全成立才能相减。"
+        "批 7 起成本侧有了公司自报的数，但能配上对的公司期极少——"
+        "实测全语料只有牧原 2026-06 一条（11.7 元/公斤的全口径自报成本 × "
+        "当月商品猪均价），其余都因「期间不同期」或「口径子集」被 skip。"
+        "牧场实测里有**分部毛利率**，但批 5.1 起它是**另一格**"
+        "（:data:`M_PIG_SEGMENT_GROSS_MARGIN`）：一个百分比，不是每公斤"
         "赚几毛。**不许拿它顶替本格**——现在连指标 id 都不同，写错就查得出来。",
     M_PIG_PROFIT_EXPOSURE:
         "本指标的正身是**猪业净利润占比**，而分部附注只给毛利占比——毛利占比里"
@@ -682,21 +790,45 @@ GAP_REASONS = {
         "「这一格是 missing」的正常含义是**本地序列还没落库**（抓取失败也是"
         "missing，不 fallback 到手填数，见 §三十一）。",
     M_FULL_COST:
-        "完全成本要「出栏口径的成本总额 ÷ 已售活重」，而两者本批都取不到："
-        "分部成本含屠宰与饲料（口径宽），出栏量要走月度简报（无本地缓存）。"
-        "**不拿分部毛利率反推**——那会把宽口径的成本当成养殖完全成本。",
+        "正身（``COMPLETE_COST_PER_KG``）要「出栏口径的成本总额 ÷ 已售活重」，"
+        "两者都取不到：分部成本含屠宰与饲料（口径宽），出栏量要走月度简报"
+        "（无本地缓存）。**不拿分部毛利率反推**——那会把宽口径的成本当成养殖"
+        "完全成本。批 7 起本地语料里**有**三条公司**自报**的完全成本"
+        "（牧原 2025A 约 12、牧原 2026-06 约 11.7、新希望 2025-12 肥猪 12.2），"
+        "但它们走的是 ``FULL_COST_COMPANY_DISCLOSED`` 与 "
+        "``fattening_full_cost_per_kg`` 两个**旁证** variant：各自的口径没有"
+        "统一（含不含总部费用、是不是全口径场线都不同），拿两把尺子量出来的"
+        "数相减不是成本优势。所以正身**继续如实 missing**，自报口径只作证据。",
     M_CASH_COST:
-        "现金流量表折旧摊销在分部维度没有披露，付现成本无法从分部数据推出。",
+        "现金流量表折旧摊销在分部维度没有披露，付现成本无法从分部数据推出。"
+        "批 7 扫过全部本地语料（8 份猪企定期报告 + 120 份经营月报），"
+        "**「现金成本」四个字零出现**——不是没抽到，是公司根本没披露。"
+        "所以这一格如实 missing，界面走「未获取可靠公开数据」。",
     M_FATTENING_COST:
-        "育肥阶段成本要按阶段拆分（母猪 / 仔猪 / 育肥），公司不按这个口径披露。",
+        "正身（``fattening_cost_per_kg``，阶段增量成本）要按阶段拆分"
+        "（母猪 / 仔猪 / 育肥），公司不按这个口径披露。批 7 起有值的那个是"
+        "**另一个 variant** ``fattening_full_cost_per_kg``（新希望 2025A："
+        "正常运营场线肥猪完全成本 2025-12 降至 12.2 元/公斤）——它含期间费用、"
+        "且**只含正常运营场线**（见 :data:`SCOPE_FATTENING_NORMAL_LINES`），"
+        "两者不可互换。",
+    M_WEANED_PIGLET_COST:
+        "断奶仔猪成本要公司在定期报告里按「元/头」披露断奶成本。批 7 扫过全部"
+        "本地语料，**只有新希望 2025A p27 一条**（全年平均断奶成本 251 元/头），"
+        "牧原 / 东瑞 / 天康零披露。缺口不是解析器的问题，是披露面的问题。",
     M_COST_ADVANTAGE:
-        "相对中位数偏离要**同组公司**的完全成本截面，而同组的完全成本本批"
-        "全部缺（见上面的原因）。",
+        "相对中位数偏离要**同组公司**的完全成本截面。批 7 起有值的只有公司"
+        "**自报**口径，而同行池要求「同期间 + 同 variant + 同 scope + 同单位」"
+        "四者同时成立、且**至少 3 家**：实测 4 家猪企的自报成本落在 3 个不同的"
+        "（期间 × variant × scope）组合上，一个组合都凑不满 3 家，所以全部"
+        "``INSUFFICIENT_PEERS``。**不因为「看起来牧原成本最低」就放宽门槛**"
+        "——那正是这一格存在要防的事。",
     M_REGIONAL_PREMIUM:
         "售价溢价要「公司均价 − 同组中位数」。公司均价目前只有简报口径的"
         "年度商品猪均价（无本地缓存），**全国可比基准也没有**"
         "（``pig_sales`` 自己报 ``missing_comparable_national_benchmark``），"
-        "所以拿不到像样的溢价。",
+        "所以拿不到像样的溢价。批 9 起它**没有 factor 消费方**了（那一格已摘），"
+        "但理由照旧留着：查缺口的人先看到的是这张表，理由不该因为「暂时没人用」"
+        "而消失。",
     M_HOG_SLAUGHTER_VOLUME:
         "屠宰量要屠宰业务的经营数据（多数猪企不单独披露），本批无来源。",
     M_EFFECTIVE_CAPACITY:

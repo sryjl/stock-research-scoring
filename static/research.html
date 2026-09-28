@@ -55,6 +55,11 @@
       <div class="drawer-body" id="drawer-body"></div>
     </aside>
   </main>
+  <!-- 猪企核心经营数据的补充入口（批 8）。用 style.css 里既有的 .modal-* /
+       .form / .field 类，不新增一套弹窗样式；内容由 research.js 按后端载荷渲染。 -->
+  <div class="modal-overlay" id="pig-core-overlay" hidden>
+    <div class="modal" id="pig-core-modal"></div>
+  </div>
   <div class="toast" id="toast" hidden></div>
   <script src="/static/research.js"></script>
 </body>
